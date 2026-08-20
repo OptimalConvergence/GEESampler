@@ -34,7 +34,7 @@ class CatalogResolverConfig:
     recent_horizon_days: int = 30
     recent_refresh_hours: int = 24
     metadata_cloud_max: float = 20.0
-    cloud_mode: Literal["hybrid_inline", "metadata_only"] = "hybrid_inline"
+    cloud_mode: Literal["hybrid_inline", "hybrid_probe", "metadata_only"] = "hybrid_inline"
     qa_band: str = "cs_cdf"
     qa_threshold: float = 0.60
     min_clear_fraction: float = 0.80
@@ -43,7 +43,7 @@ class CatalogResolverConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"read_through", "offline", "refresh"}:
             raise ValueError(f"Unknown catalog mode: {self.mode}")
-        if self.cloud_mode not in {"hybrid_inline", "metadata_only"}:
+        if self.cloud_mode not in {"hybrid_inline", "hybrid_probe", "metadata_only"}:
             raise ValueError(f"Unknown catalog cloud mode: {self.cloud_mode}")
         if self.metadata_workers <= 0:
             raise ValueError("catalog metadata_workers must be positive")
@@ -183,6 +183,14 @@ class S2CatalogResolver:
         return self.config.cloud_mode == "hybrid_inline"
 
     @property
+    def probe_quality(self) -> bool:
+        return self.config.cloud_mode == "hybrid_probe"
+
+    @property
+    def cloud_masking(self) -> bool:
+        return self.config.cloud_mode != "metadata_only"
+
+    @property
     def internal_quality_band(self) -> str:
         return INLINE_CLEAR_BAND
 
@@ -303,7 +311,7 @@ class S2CatalogResolver:
                 bbox=self._bboxes[sample.sample_id],
             )
             candidates = self._rank(candidates, sample.date, selection.mode)
-            if self.inline_quality:
+            if self.cloud_masking:
                 retained: list[SceneRecord] = []
                 grid_hash = self.grid_hash(sample)
                 for candidate in candidates:
@@ -486,6 +494,19 @@ class S2CatalogResolver:
         masked = image.updateMask(clear)
         quality = clear.unmask(0).uint8().rename(INLINE_CLEAR_BAND) if include_band else None
         return masked, quality
+
+    def quality_image(self, image: Any) -> Any:
+        """Return only the one-byte Cloud Score+ clear mask for a cheap QA probe."""
+        linked = image.linkCollection(
+            self.ee.ImageCollection(CLOUD_SCORE_COLLECTION), [self.config.qa_band]
+        )
+        return (
+            linked.select(self.config.qa_band)
+            .gte(self.config.qa_threshold)
+            .unmask(0)
+            .uint8()
+            .rename(INLINE_CLEAR_BAND)
+        )
 
 
 __all__ = [

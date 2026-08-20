@@ -99,6 +99,49 @@ catalog:
     assert config.catalog.resolver.qa_threshold == 0.65
 
 
+def test_yaml_distributed_accounts(tmp_path, monkeypatch):
+    monkeypatch.setenv("ACCOUNT_ONE_PROJECT", "shared-project")
+    monkeypatch.setenv("ACCOUNT_TWO_PROJECT", "shared-project")
+    config_path = tmp_path / "distributed.yaml"
+    config_path.write_text(
+        """
+accounts:
+  - name: first
+    auth: {project: "${ACCOUNT_ONE_PROJECT}", high_volume: true}
+    workers: 8
+  - name: second
+    auth: {project: "${ACCOUNT_TWO_PROJECT}", high_volume: true}
+    workers: 8
+distributed:
+  max_inflight_per_project: 16
+run:
+  output_dir: ./out
+  monitoring: {enabled: false}
+""",
+        encoding="utf-8",
+    )
+    config = SamplerConfig.from_yaml(config_path)
+    assert config.distributed.enabled
+    assert config.distributed.max_inflight_per_project == 16
+    assert [account.name for account in config.accounts] == ["first", "second"]
+    assert config.auth == config.accounts[0].auth
+
+
+def test_distributed_config_requires_two_enabled_accounts(tmp_path):
+    config_path = tmp_path / "distributed.yaml"
+    config_path.write_text(
+        """
+accounts:
+  - name: only
+    auth: {project: project-x}
+distributed: {enabled: true}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="at least two"):
+        SamplerConfig.from_yaml(config_path)
+
+
 def test_sample_rejects_unsupported_geometry():
     with pytest.raises(ValueError, match="Unsupported"):
         SampleRecord("x", {"type": "LineString", "coordinates": []})

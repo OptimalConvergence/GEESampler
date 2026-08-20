@@ -9,6 +9,7 @@ __pycache__/
 build/
 dist/
 geesampler-output/
+artifacts/v0_3_live/
 *.partial
 *.sqlite
 *.tif

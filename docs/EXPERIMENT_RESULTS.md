@@ -117,3 +117,85 @@ Four metadata workers are the fastest tested cold-sync setting, while two
 workers remain a lower-pressure default. Cloud Monitoring has delayed sampling
 windows, so per-tag EECU is suitable for operational comparison and guardrails,
 not exact billing reconciliation.
+
+## v0.3 account, cloud, patch, and connection-pool benchmark
+
+This follow-up ran on 2026-08-21 local time after adding per-profile processes,
+HTTP pools sized to worker count, the Cloud Score probe path, and separate wire
+versus retained-output metrics. All timed pixel cases used the high-volume
+endpoint, a warm catalog with zero `computeFeatures` calls, six S2 bands, and one
+repetition. Absolute throughput was lower than the prior run, so comparisons
+below are within this run only.
+
+The eight-sample metadata-only patch sweep produced:
+
+| Patch | Accepted | Samples/s | Useful MiB/s | MP/s | p95 pixel time (s) | EECU-s/success |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 8/8 | 0.326 | 0.042 | 0.005 | 3.21 | 0.123 |
+| 256 | 8/8 | 0.345 | 0.174 | 0.023 | 9.48 | 0.301 |
+| 336 | 8/8 | 0.363 | 0.313 | 0.041 | 17.04 | 0.491 |
+| 512 | 8/8 | 0.146 | 0.284 | 0.038 | 41.99 | 1.023 |
+| 768 | 8/8 | 0.286 | 1.239 | 0.169 | 25.32 | 2.077 |
+| 1024 | 8/8 | 0.397 | 3.029 | 0.416 | 9.30 | 3.087 |
+| 1536 | 7/8 | 0.017 | 0.286 | 0.041 | 218.10 | 9.052 |
+| 1792 | 0/8 | 0 | 0 | 0 | n/a | n/a |
+
+Earth Engine rejected seven 1792 requests because their uncompressed
+request was 57,802,752 bytes, above the 50,331,648-byte limit; the remaining
+candidate did not resolve through the preprocessed collection. This live result supersedes the initial
+uint16-only estimate and is why the package now uses a conservative promoted-
+type estimate and stops the default sweep at 1536. Although 1024 delivered the
+best successful wire and spatial throughput in this small run, it used about
+6.3 times the EECU per success of 336. The 1536 tail makes it unsuitable as a
+general default. Keep 336 as the balanced training default; use 768 or 1024 only
+when larger spatial context materially benefits the model.
+
+At 336 pixels, the cloud-policy comparison was:
+
+| Policy | Samples/s | Wire MiB/s | Useful MiB/s | Wire efficiency | QA rejections | p95 (s) | EECU-s/success |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Metadata only | 0.363 | 0.313 | 0.313 | 100.0% | 0 | 17.04 | 0.491 |
+| Hybrid probe | 0.537 | 0.463 | 0.462 | 99.8% | 4 | 7.40 | 0.880 |
+| Hybrid inline | 0.198 | 0.206 | 0.172 | 83.2% | 4 | 10.92 | 0.978 |
+
+Metadata-only remains a speed baseline, not a production-quality equivalent.
+Both Cloud Score modes rejected the same four candidates. The probe avoided
+full multispectral transfers for those candidates and outperformed inline QA in
+this run, so `hybrid_probe` is the preferred production experiment when local
+cloud rejection is common. Retain `hybrid_inline` when a single request is more
+important than minimizing rejected bytes.
+
+The saturated 32-sample metadata-only worker sweep used the same inputs in every
+case; each case accepted the same 27 samples and hit the same five unresolved
+scene/collection combinations:
+
+| Threads | Samples/s | Useful MiB/s | p95 (s) | EECU-s/success |
+|---:|---:|---:|---:|---:|
+| 4 | 0.488 | 0.430 | 8.09 | 0.486 |
+| 8 | 0.385 | 0.339 | 16.65 | 0.489 |
+| 16 | 0.256 | 0.225 | 11.57 | 0.506 |
+| 32 | 0.417 | 0.367 | 7.80 | 0.502 |
+
+Sizing the HTTP pool removed the earlier ten-connection-pool warning, but more
+threads still did not monotonically improve throughput. Four was fastest in
+this one-repetition network state; eight remains a conservative general default
+pending repeated regional trials. Post-run diagnosis found that the S2 callback
+filtered on the source polygon while the local resolver searched the full patch
+footprint; the callback now filters on that same footprint. It also exposed
+catalog candidates absent from the preprocessed collection, so those now fall
+through to the next ranked candidate. A targeted rerun of the five failures
+recovered both affected samples; the remaining three correctly reported no
+metadata-qualified scene. The identical original failures do not bias the
+relative worker comparison, but its absolute success rate is superseded by this
+targeted validation.
+
+Finally, the two-profile scheduler was exercised on eight samples. The second
+identity authenticated but lacked `earthengine.computations.create`; its four
+leases were retried by the healthy profile and the aggregate run finished 8/8.
+The error saved to the summary contains only the profile alias and a redacted
+`<project>` placeholder. This validates process isolation, project-level caps,
+and failover, but it is not a two-account speed measurement. Grant the service
+identity project-level Earth Engine Resource Viewer plus Service Usage Consumer
+before repeating the fair 1×8, 1×16, and 2×8 matrix. Total refreshed usage for
+the new pixel benchmarks was roughly 0.06 EECU-hours, far below the 100-hour
+ceiling.

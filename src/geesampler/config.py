@@ -4,7 +4,7 @@ import importlib
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -52,27 +52,82 @@ class CatalogSettings:
 
 
 @dataclass(frozen=True)
+class AccountProfile:
+    name: str
+    auth: AuthConfig
+    workers: int = 8
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", self.name):
+            raise ValueError("account profile name must use 1-32 letters, digits, '_' or '-'")
+        if self.workers <= 0:
+            raise ValueError("account workers must be positive")
+
+
+@dataclass(frozen=True)
+class DistributedRunConfig:
+    enabled: bool = False
+    max_inflight_per_project: int = 32
+    failover_attempts: int = 1
+    scheduler: str = "affinity_least_loaded"
+
+    def __post_init__(self) -> None:
+        if self.max_inflight_per_project <= 0:
+            raise ValueError("max_inflight_per_project must be positive")
+        if self.failover_attempts < 0:
+            raise ValueError("failover_attempts must be non-negative")
+        if self.scheduler != "affinity_least_loaded":
+            raise ValueError(f"Unknown distributed scheduler: {self.scheduler}")
+
+
+@dataclass(frozen=True)
 class SamplerConfig:
     auth: AuthConfig
     run: RunConfig
     proxy_url: str | None
     raw: Mapping[str, Any]
     catalog: CatalogSettings | None = None
+    accounts: tuple[AccountProfile, ...] = field(default_factory=tuple)
+    distributed: DistributedRunConfig = field(default_factory=DistributedRunConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> SamplerConfig:
         payload = _expand(yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})
+        def parse_auth(auth_data: Mapping[str, Any], label: str) -> AuthConfig:
+            if not auth_data.get("project"):
+                raise ValueError(f"{label}.project is required")
+            return AuthConfig(
+                project=str(auth_data["project"]),
+                service_account=auth_data.get("service_account") or None,
+                key_file=Path(auth_data["key_file"]).expanduser()
+                if auth_data.get("key_file")
+                else None,
+                high_volume=bool(auth_data.get("high_volume", False)),
+            )
+
+        account_data = payload.get("accounts", [])
         auth_data = payload.get("auth", {})
-        if not auth_data.get("project"):
-            raise ValueError("auth.project is required")
-        auth = AuthConfig(
-            project=str(auth_data["project"]),
-            service_account=auth_data.get("service_account") or None,
-            key_file=Path(auth_data["key_file"]).expanduser()
-            if auth_data.get("key_file")
-            else None,
-            high_volume=bool(auth_data.get("high_volume", False)),
-        )
+        if account_data:
+            accounts = tuple(
+                AccountProfile(
+                    name=str(item.get("name", "")),
+                    auth=parse_auth(item.get("auth", {}), f"accounts[{index}].auth"),
+                    workers=int(item.get("workers", 8)),
+                    enabled=bool(item.get("enabled", True)),
+                )
+                for index, item in enumerate(account_data)
+            )
+            enabled_accounts = tuple(account for account in accounts if account.enabled)
+            if not enabled_accounts:
+                raise ValueError("At least one account profile must be enabled")
+            names = [account.name for account in accounts]
+            if len(names) != len(set(names)):
+                raise ValueError("Account profile names must be unique")
+            auth = enabled_accounts[0].auth
+        else:
+            auth = parse_auth(auth_data, "auth")
+            accounts = ()
         run_data = payload.get("run", {})
         monitor_data = run_data.get("monitoring", {})
         eecu = EECUMonitorConfig(
@@ -92,6 +147,17 @@ class SamplerConfig:
             workload_prefix=str(run_data.get("workload_prefix", "geesampler")),
             eecu=eecu,
         )
+        distributed_data = payload.get("distributed", {})
+        distributed = DistributedRunConfig(
+            enabled=bool(distributed_data.get("enabled", bool(account_data))),
+            max_inflight_per_project=int(
+                distributed_data.get("max_inflight_per_project", 32)
+            ),
+            failover_attempts=int(distributed_data.get("failover_attempts", 1)),
+            scheduler=str(distributed_data.get("scheduler", "affinity_least_loaded")),
+        )
+        if distributed.enabled and len(tuple(account for account in accounts if account.enabled)) < 2:
+            raise ValueError("Distributed sampling requires at least two enabled accounts")
         catalog_data = payload.get("catalog", {})
         catalog = None
         if bool(catalog_data.get("enabled", False)):
@@ -117,7 +183,7 @@ class SamplerConfig:
                     group_downloads=bool(catalog_data.get("group_downloads", True)),
                 ),
             )
-        return cls(auth, run, payload.get("proxy_url"), payload, catalog)
+        return cls(auth, run, payload.get("proxy_url"), payload, catalog, accounts, distributed)
 
 
 def patch_settings(payload: Mapping[str, Any]) -> tuple[PatchGrid, SceneSelection]:

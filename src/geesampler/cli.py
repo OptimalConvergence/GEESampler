@@ -5,6 +5,7 @@ import json
 import logging
 from dataclasses import asdict
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from .benchmark import refresh_benchmark_eecu
 from .cache import cache_mining_polygons
 from .catalog import S2SceneCatalog
 from .config import SamplerConfig, load_callable, patch_settings
+from .distributed import DistributedSampler
 from .engine import make_workload_tag
 from .models import parse_datetime
 from .resolver import S2_COLLECTION
@@ -43,15 +45,51 @@ def _source(sampler: Sampler, payload: dict[str, Any]):
 
 def run_config(path: str | Path) -> dict[str, Any]:
     config = SamplerConfig.from_yaml(path)
-    sampler = Sampler(config)
     payload = dict(config.raw)
+    sampler = Sampler(
+        config,
+        initialize=(
+            not config.distributed.enabled
+            or payload.get("source", {}).get("type", "file") == "gee"
+        ),
+    )
     source = _source(sampler, payload)
     source_data = payload.get("source", {})
     records = source.records(source_data.get("limit"))
     download = payload.get("download", {})
-    builder = load_callable(download["collection_builder"])
+    builder_path = download["collection_builder"]
+    builder_kwargs = dict(download.get("builder_kwargs", {}))
+    builder = partial(load_callable(builder_path), **builder_kwargs)
     bands = download["bands"]
     kind = download.get("kind", "patch")
+    if config.distributed.enabled:
+        distributed = DistributedSampler(config)
+        if kind == "point":
+            _, selection = patch_settings(payload)
+            summary = distributed.download_point_series(
+                records,
+                builder_path,
+                builder_kwargs=builder_kwargs,
+                bands=bands,
+                scale=float(download.get("scale", 10)),
+                selection=selection,
+                scenario=download.get("scenario", "points"),
+                run_id=download.get("run_id"),
+            )
+        else:
+            grid, selection = patch_settings(payload)
+            summary = distributed.download_patch_series(
+                records,
+                builder_path,
+                builder_kwargs=builder_kwargs,
+                bands=bands,
+                grid=grid,
+                selection=selection,
+                mask_builder=download.get("mask_builder"),
+                scenario=download.get("scenario", "patches"),
+                run_id=download.get("run_id"),
+            )
+        return summary.to_dict()
     if kind == "point":
         _, selection = patch_settings(payload)
         summary = sampler.download_point_series(

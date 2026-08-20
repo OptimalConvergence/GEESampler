@@ -192,3 +192,37 @@ def test_resolver_retries_metadata_without_marking_partial_coverage(tmp_path):
     resolver.prepare([sample], grid=PatchGrid(), selection=SceneSelection(), workload_tag="tag")
     assert attempts == resolver.stats().compute_features_calls == 2
     assert resolver.candidates(sample)
+
+
+def test_hybrid_probe_reuses_cached_quality_decision(tmp_path):
+    catalog = S2SceneCatalog(tmp_path / "s2.sqlite")
+    sample = SampleRecord(
+        "sample",
+        {"type": "Point", "coordinates": [0, 0]},
+        datetime(2020, 7, 1, tzinfo=timezone.utc),
+    )
+    config = CatalogResolverConfig(
+        recent_horizon_days=0,
+        cloud_mode="hybrid_probe",
+    )
+    resolver = S2CatalogResolver(
+        catalog,
+        ee_module=object(),
+        config=config,
+        tile_locator=lambda _grid: ({"31TCJ"}, (-1, -1, 1, 1)),
+        metadata_fetcher=lambda *_args: [_scene("collection/scene-a", 1_593_561_600_000)],
+    )
+    resolver.prepare([sample], grid=PatchGrid(), selection=SceneSelection(), workload_tag="tag")
+    scene = resolver.candidates(sample)[0]
+    catalog.record_quality(scene, resolver.grid_hash(sample), "cs_cdf", 0.6, 0.8, 0.2, False)
+
+    cached = S2CatalogResolver(
+        catalog,
+        ee_module=object(),
+        config=config,
+        tile_locator=lambda _grid: ({"31TCJ"}, (-1, -1, 1, 1)),
+        metadata_fetcher=lambda *_args: [],
+    )
+    cached.prepare([sample], grid=PatchGrid(), selection=SceneSelection(), workload_tag="tag")
+    assert cached.candidates(sample) == []
+    assert cached.stats().quality_cache_hits == 1

@@ -1,0 +1,59 @@
+accounts:
+  - name: primary
+    workers: 8
+    auth:
+      project: ${GEE_PROJECT}
+      high_volume: true
+  - name: secondary
+    workers: 8
+    auth:
+      project: ${GEE_PROJECT_SECONDARY}
+      service_account: ${GEE_SERVICE_ACCOUNT_SECONDARY}
+      key_file: ${GEE_KEY_FILE_SECONDARY}
+      high_volume: true
+
+proxy_url: ${HTTPS_PROXY:-}
+
+distributed:
+  enabled: true
+  max_inflight_per_project: 16
+  failover_attempts: 1
+
+catalog:
+  enabled: true
+  path: ${GEESAMPLER_DATA_ROOT:-./geesampler-output}/catalog/sentinel2.sqlite
+  mode: read_through
+  metadata_workers: 2
+  metadata_cloud_max: 20
+  cloud: {mode: hybrid_probe, band: cs_cdf, threshold: 0.60, min_clear_fraction: 0.80}
+
+run:
+  output_dir: ${GEESAMPLER_DATA_ROOT:-./geesampler-output}/distributed-runs
+  retries: 4
+  workload_prefix: geesampler
+  monitoring:
+    enabled: true
+    required: false
+    poll_seconds: 30
+    warning_eecu_hours: 80
+    hard_eecu_hours: 100
+
+source:
+  type: file
+  path: examples/data/points.csv
+  id_column: SampleID
+  date_column: Date
+  limit: 8
+
+download:
+  kind: patch
+  scenario: distributed-s2
+  collection_builder: geesampler.recipes.sentinel2:sentinel2_catalog_collection
+  bands: [B2, B3, B4, B8, B11, B12]
+  patch_size: 336
+  scale: 10
+  selection:
+    mode: latest
+    start_offset_days: 0
+    end_offset_days: 90
+    max_scenes: 1

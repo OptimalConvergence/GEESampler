@@ -25,7 +25,11 @@ class Sampler:
     def __init__(self, config: SamplerConfig, *, initialize: bool = True):
         self.config = config
         configure_proxy(config.proxy_url)
-        self.ee = initialize_earth_engine(config.auth) if initialize else None
+        self.ee = (
+            initialize_earth_engine(config.auth, pool_size=config.run.workers)
+            if initialize
+            else None
+        )
         self._catalog_resolver: S2CatalogResolver | None = None
 
     @classmethod

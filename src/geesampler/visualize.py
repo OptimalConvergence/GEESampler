@@ -82,7 +82,11 @@ def plot_benchmark(csv_path: str | Path, output_path: str | Path) -> Path:
         raise ValueError("Benchmark CSV is empty")
     labels = [row["case"] for row in rows]
     bandwidth = [float(row["bandwidth_mib_per_second"]) for row in rows]
+    useful_bandwidth = [
+        float(row.get("useful_bandwidth_mib_per_second") or "nan") for row in rows
+    ]
     sample_rate = [float(row.get("samples_per_second") or "nan") for row in rows]
+    megapixels = [float(row.get("megapixels_per_second") or "nan") for row in rows]
     eecu = [float(row["eecu_per_success"] or "nan") for row in rows]
     latency_key = (
         "compute_pixels_p95_seconds"
@@ -93,21 +97,25 @@ def plot_benchmark(csv_path: str | Path, output_path: str | Path) -> Path:
     order = np.argsort(bandwidth if all(np.isnan(value) for value in sample_rate) else sample_rate)
     labels = [labels[index] for index in order]
     bandwidth = [bandwidth[index] for index in order]
+    useful_bandwidth = [useful_bandwidth[index] for index in order]
     sample_rate = [sample_rate[index] for index in order]
+    megapixels = [megapixels[index] for index in order]
     eecu = [eecu[index] for index in order]
     latency = [latency[index] for index in order]
     y = np.arange(len(labels))
 
     figure, axes_grid = plt.subplots(
         2,
-        2,
-        figsize=(16, max(7, len(labels) * 0.65)),
+        3,
+        figsize=(20, max(7, len(labels) * 0.65)),
         sharey=True,
     )
     axes = axes_grid.ravel()
     panels = (
         (sample_rate, "Successful sample throughput", "samples/s", BLUE, "#1D4ED8"),
-        (bandwidth, "Downloaded payload throughput", "MiB/s", "#BED7F7", BLUE),
+        (bandwidth, "Wire payload throughput", "MiB/s", "#BED7F7", BLUE),
+        (useful_bandwidth, "Retained-output throughput", "MiB/s", "#B7E4C7", "#2D6A4F"),
+        (megapixels, "Spatial throughput", "MP/s", "#D8CDF0", "#6D4BA0"),
         (eecu, "Reported compute per successful sample", "EECU-seconds/sample", "#F7E7B2", GOLD),
         (
             latency,

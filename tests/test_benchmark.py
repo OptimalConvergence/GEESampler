@@ -117,8 +117,15 @@ def test_benchmark_catalog_copy_preserves_metadata_without_sharing_quality(tmp_p
         start=datetime(2020, 1, 1, tzinfo=timezone.utc),
         end=datetime(2021, 1, 1, tzinfo=timezone.utc),
     )
+    source.record_quality(scene, "grid", "cs_cdf", 0.6, 0.8, 0.9, True)
     destination_path = tmp_path / "destination.sqlite"
     benchmark._copy_catalog(source_path, destination_path)
+    benchmark._clear_catalog_quality(destination_path)
     destination = S2SceneCatalog(destination_path)
     assert destination.stats().scenes == 1
     assert destination.stats().patch_quality_rows == 0
+
+
+def test_patch_payload_estimate_enforces_compute_pixels_limit():
+    assert benchmark.estimate_uncompressed_mib(1536, 6) < 48
+    assert benchmark.estimate_uncompressed_mib(1792, 6) > 48

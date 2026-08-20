@@ -40,12 +40,11 @@ def sentinel2_collection(
     """S2 SR linked with Cloud Score+, with optional server-side patch filtering."""
     import ee
 
-    geometry = ee.Geometry(sample.geometry)
     footprint = patch_geometry(sample, grid)
-    source = ee.ImageCollection(S2_COLLECTION).filterBounds(geometry)
+    source = ee.ImageCollection(S2_COLLECTION).filterBounds(footprint)
     if not server_quality_filter:
         return source
-    cloud_score = ee.ImageCollection(CLOUD_SCORE_COLLECTION).filterBounds(geometry)
+    cloud_score = ee.ImageCollection(CLOUD_SCORE_COLLECTION).filterBounds(footprint)
     linked = source.linkCollection(cloud_score, ["cs_cdf"])
 
     def score(image):

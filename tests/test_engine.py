@@ -8,7 +8,7 @@ import rasterio
 from rasterio.io import MemoryFile
 
 from geesampler.catalog import SceneRecord
-from geesampler.engine import DownloadEngine, make_workload_tag
+from geesampler.engine import DownloadEngine, make_workload_tag, redact_error
 from geesampler.models import (
     EECUMonitorConfig,
     PatchGrid,
@@ -69,6 +69,16 @@ def test_workload_tag_matches_live_api_contract():
     tag = make_workload_tag("GEE.Sampler", "Prepared S2", "Run.01")
     assert tag == "gee-sampler-prepared-s2-run-01"
     assert len(tag) <= 63
+
+
+def test_error_redaction_removes_credential_shapes():
+    message = redact_error(
+        "account=name@example.iam.gserviceaccount.com Authorization: Bearer abc.def "
+        "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"
+    )
+    assert "name@example" not in message
+    assert "abc.def" not in message
+    assert "secret" not in message
 
 
 def test_patch_request_grid_tag_manifest_and_resume(tmp_path):
@@ -203,6 +213,22 @@ def _quality_tiff(clear: bool) -> bytes:
         return memory.read()
 
 
+def _single_band_tiff(clear: bool) -> bytes:
+    profile = {
+        "driver": "GTiff",
+        "width": 4,
+        "height": 4,
+        "count": 1,
+        "dtype": "uint16",
+        "crs": "EPSG:4326",
+        "transform": rasterio.transform.from_origin(0, 4, 1, 1),
+    }
+    with MemoryFile() as memory:
+        with memory.open(**profile) as dataset:
+            dataset.write(np.full((4, 4), int(clear), dtype="uint16"), 1)
+        return memory.read()
+
+
 class ResolvedData:
     def __init__(self):
         self.requests = []
@@ -305,3 +331,94 @@ def test_resolved_inline_quality_rejects_then_accepts_without_compute_features(t
     assert summary.catalog_metrics["catalog_hit_rate"] == 1.0
     profile = json.loads((tmp_path / "inline" / "profile.json").read_text(encoding="utf-8"))
     assert profile["steps"]["compute_pixels"]["p95_seconds"] >= 0
+
+
+class ProbeResolver(ResolvedResolver):
+    inline_quality = False
+    probe_quality = True
+
+    @staticmethod
+    def quality_image(image):
+        return image
+
+
+class MetadataResolver(ResolvedResolver):
+    inline_quality = False
+    probe_quality = False
+    cloud_masking = False
+
+
+def test_hybrid_probe_rejects_with_one_band_before_full_download(tmp_path):
+    fake = ResolvedEE()
+    rejected = _single_band_tiff(False)
+    accepted = _single_band_tiff(True)
+    data = _single_band_tiff(True)
+    fake.data.payloads = [rejected, accepted, data]
+    resolver = ProbeResolver()
+    engine = DownloadEngine(
+        "project",
+        RunConfig(tmp_path, workers=2, retries=0, eecu=EECUMonitorConfig(enabled=False)),
+        ee_module=fake,
+    )
+    sample = SampleRecord(
+        "sample-1",
+        {"type": "Point", "coordinates": [3, 45]},
+        datetime(2021, 7, 1, tzinfo=timezone.utc),
+    )
+    summary = engine.download_patch_series(
+        [sample],
+        lambda _sample: ResolvedCollection(),
+        bands=["B2"],
+        grid=PatchGrid(4, 10),
+        scene_resolver=resolver,
+        run_id="probe",
+    )
+    assert summary.succeeded == 1
+    assert [request["bandIds"] for request in fake.data.requests] == [
+        ["geesampler_clear"],
+        ["geesampler_clear"],
+        ["B2"],
+    ]
+    assert resolver.recorded == [("scene-a", 0.0, False), ("scene-b", 1.0, True)]
+    assert summary.bytes_downloaded == sum(map(len, (rejected, accepted, data)))
+    assert summary.retained_bytes > 0
+    assert summary.useful_bandwidth_mib_per_second > 0
+
+
+def test_missing_preprocessed_candidate_falls_back_to_next_scene(tmp_path):
+    fake = ResolvedEE()
+
+    class FallbackData:
+        def __init__(self):
+            self.requests = []
+
+        def computePixels(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise ValueError("Image.select: Parameter 'input' is required and may not be null.")
+            return _single_band_tiff(True)
+
+    fake.data = FallbackData()
+    resolver = MetadataResolver()
+    engine = DownloadEngine(
+        "project",
+        RunConfig(tmp_path, workers=1, retries=0, eecu=EECUMonitorConfig(enabled=False)),
+        ee_module=fake,
+    )
+    sample = SampleRecord(
+        "sample-1",
+        {"type": "Point", "coordinates": [3, 45]},
+        datetime(2021, 7, 1, tzinfo=timezone.utc),
+    )
+    summary = engine.download_patch_series(
+        [sample],
+        lambda _sample: ResolvedCollection(),
+        bands=["B2"],
+        grid=PatchGrid(4, 10),
+        scene_resolver=resolver,
+        run_id="fallback",
+    )
+    assert summary.succeeded == 1
+    assert len(fake.data.requests) == 2
+    assert summary.results[0].scene_id == "scene-b"
+    assert summary.results[0].attempts == 2

@@ -12,7 +12,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -34,6 +34,35 @@ from .models import (
 from .monitoring import CloudEECUReader, EECUMonitor
 
 LOGGER = logging.getLogger(__name__)
+_SERVICE_ACCOUNT_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.gserviceaccount\.com")
+_BEARER_TOKEN = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*")
+_MISSING_IMAGE_ERROR = "Parameter 'input' is required and may not be null"
+
+
+@dataclass(frozen=True)
+class _QualityProbe:
+    clear_fraction: float | None
+    accepted: bool
+    bytes_downloaded: int
+    elapsed_seconds: float
+    attempts: int
+    timings: Mapping[str, float]
+    error: str | None = None
+
+
+def redact_error(value: object) -> str:
+    """Remove credential-shaped values before errors reach logs or manifests."""
+    text = str(value)
+    text = _SERVICE_ACCOUNT_EMAIL.sub("<service-account>", text)
+    text = _BEARER_TOKEN.sub(r"\1<token>", text)
+    text = re.sub(
+        r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----.*?"
+        r"-----END (?:[A-Z]+ )*PRIVATE KEY-----",
+        "<private-key>",
+        text,
+        flags=re.DOTALL,
+    )
+    return text
 
 
 def make_workload_tag(prefix: str, scenario: str, run_id: str) -> str:
@@ -289,7 +318,9 @@ class DownloadEngine:
                 if self.config.eecu.required:
                     ledger.close()
                     raise
-                LOGGER.warning("EECU monitor unavailable at startup: %s", exc)
+                LOGGER.warning(
+                    "EECU monitor unavailable at startup (%s)", type(exc).__name__
+                )
         monitor = EECUMonitor(
             self.config.eecu,
             reader,
@@ -341,7 +372,7 @@ class DownloadEngine:
                                     bytes_downloaded=0,
                                     elapsed_seconds=0,
                                     attempts=1,
-                                    error=str(exc),
+                                    error=redact_error(exc),
                                 )
                             ]
                         batch = [
@@ -613,12 +644,61 @@ class DownloadEngine:
                 image = image.addBands(mask)
                 request_bands.append("sample_mask")
             cached_quality = scene_resolver.cached_quality(sample, scene)
+            if cached_quality is not None and not cached_quality[1]:
+                continue
             validate_quality = scene_resolver.inline_quality and cached_quality is None
             quality = None
             if scene_resolver.inline_quality:
                 image, quality = scene_resolver.apply_inline_quality(
                     image, include_band=validate_quality
                 )
+            probe_bytes = 0
+            probe_seconds = 0.0
+            probe_attempts = 0
+            probe_timings: dict[str, float] = {}
+            if getattr(scene_resolver, "probe_quality", False) and cached_quality is None:
+                probe = self._probe_quality(
+                    scene_resolver.quality_image(raw_image),
+                    computed_grid.to_ee(),
+                    workload_tag,
+                    scene_resolver.internal_quality_band,
+                    scene_resolver.min_clear_fraction,
+                )
+                if probe.error is not None:
+                    results.append(
+                        TaskResult(
+                            task_id,
+                            sample.sample_id,
+                            "failed",
+                            None,
+                            probe.bytes_downloaded,
+                            collection_seconds + probe.elapsed_seconds,
+                            probe.attempts,
+                            error=probe.error,
+                            scene_id=scene.scene_id,
+                            scene_date=scene_date,
+                            clear_fraction=probe.clear_fraction,
+                            timings={
+                                "collection_builder": collection_seconds,
+                                **probe.timings,
+                            },
+                        )
+                    )
+                    break
+                scene_resolver.record_quality(
+                    sample, scene, probe.clear_fraction or 0.0, probe.accepted
+                )
+                if not probe.accepted:
+                    rejected_bytes += probe.bytes_downloaded
+                    rejected_seconds += probe.elapsed_seconds
+                    rejected_attempts += probe.attempts
+                    continue
+                probe_bytes = probe.bytes_downloaded
+                probe_seconds = probe.elapsed_seconds
+                probe_attempts = probe.attempts
+                probe_timings = dict(probe.timings)
+            if getattr(scene_resolver, "probe_quality", False):
+                image, _ = scene_resolver.apply_inline_quality(image, include_band=False)
             if quality is not None:
                 image = image.addBands(quality)
                 request_bands.append(scene_resolver.internal_quality_band)
@@ -640,8 +720,16 @@ class DownloadEngine:
                 timings={
                     "collection_builder": collection_seconds,
                     "scene_filter": scene_filter_seconds,
+                    **probe_timings,
                 },
             )
+            if probe_bytes or probe_seconds:
+                result = replace(
+                    result,
+                    bytes_downloaded=result.bytes_downloaded + probe_bytes,
+                    elapsed_seconds=result.elapsed_seconds + probe_seconds,
+                    attempts=result.attempts + probe_attempts,
+                )
             if validate_quality and result.clear_fraction is not None:
                 quality_accepted = result.error != "quality_rejected"
                 scene_resolver.record_quality(
@@ -661,7 +749,7 @@ class DownloadEngine:
                         attempts=result.attempts + rejected_attempts,
                         timings={
                             **result.timings,
-                            "quality_rejected_downloads": rejected_seconds,
+                            "candidate_fallback_seconds": rejected_seconds,
                         },
                     )
                     rejected_bytes = 0
@@ -669,6 +757,11 @@ class DownloadEngine:
                     rejected_attempts = 0
                 results.append(result)
                 accepted += 1
+            elif _MISSING_IMAGE_ERROR in (result.error or ""):
+                rejected_bytes += result.bytes_downloaded
+                rejected_seconds += result.elapsed_seconds
+                rejected_attempts += result.attempts
+                continue
             else:
                 results.append(result)
                 break
@@ -682,14 +775,81 @@ class DownloadEngine:
                     bytes_downloaded=rejected_bytes,
                     elapsed_seconds=rejected_seconds + collection_seconds,
                     attempts=max(1, rejected_attempts),
-                    error="No scene met inline cloud quality",
+                    error=(
+                        "No scene met Cloud Score quality"
+                        if getattr(scene_resolver, "cloud_masking", False)
+                        else "No catalog candidate was present in preprocessed collection"
+                    ),
                     timings={
                         "collection_builder": collection_seconds,
-                        "quality_rejected_downloads": rejected_seconds,
+                        "candidate_fallback_seconds": rejected_seconds,
                     },
                 )
             )
         return results
+
+    def _probe_quality(
+        self,
+        image: Any,
+        grid: Mapping[str, Any],
+        workload_tag: str,
+        quality_band: str,
+        min_clear_fraction: float,
+    ) -> _QualityProbe:
+        """Download a one-band byte mask before requesting a full multispectral patch."""
+        try:
+            from rasterio.io import MemoryFile
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("Cloud-quality probes require the 'geo' extra (rasterio)") from exc
+
+        attempts = 0
+        started = time.monotonic()
+        transferred = 0
+        error: Exception | None = None
+        while attempts <= self.config.retries:
+            attempts += 1
+            try:
+                compute_started = time.monotonic()
+                payload = self.ee.data.computePixels(
+                    {
+                        "expression": image,
+                        "fileFormat": "GEO_TIFF",
+                        "bandIds": [quality_band],
+                        "grid": dict(grid),
+                        "workloadTag": workload_tag,
+                    }
+                )
+                compute_seconds = time.monotonic() - compute_started
+                transferred += len(payload)
+                qa_started = time.monotonic()
+                with MemoryFile(payload) as memory, memory.open() as source:
+                    clear_fraction = float((source.read(1) > 0).mean())
+                qa_seconds = time.monotonic() - qa_started
+                return _QualityProbe(
+                    clear_fraction,
+                    clear_fraction >= min_clear_fraction,
+                    transferred,
+                    time.monotonic() - started,
+                    attempts,
+                    {
+                        "quality_probe_compute_pixels": compute_seconds,
+                        "quality_probe_local_qa": qa_seconds,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - remote errors are retried uniformly
+                error = exc
+                if attempts <= self.config.retries:
+                    delay = self.config.retry_base_seconds * (2 ** (attempts - 1))
+                    time.sleep(delay + random.random() * min(1.0, delay / 4.0))
+        return _QualityProbe(
+            None,
+            False,
+            transferred,
+            time.monotonic() - started,
+            attempts,
+            {},
+            redact_error(error),
+        )
 
     def _select_scenes(
         self,
@@ -839,6 +999,8 @@ class DownloadEngine:
                         "payload_write": write_seconds,
                         "local_qa_and_split": time.monotonic() - local_started,
                     },
+                    retained_bytes=output.stat().st_size
+                    + (mask_output.stat().st_size if mask_output else 0),
                 )
             except Exception as exc:  # noqa: BLE001 - remote errors are retried uniformly
                 error = exc
@@ -856,7 +1018,7 @@ class DownloadEngine:
             0,
             time.monotonic() - started,
             attempts,
-            error=str(error),
+            error=redact_error(error),
             scene_id=scene_id,
             scene_date=scene_date,
             timings=base_timings,
@@ -982,6 +1144,7 @@ class DownloadEngine:
                     output.stat().st_size,
                     time.monotonic() - started,
                     attempts,
+                    retained_bytes=output.stat().st_size,
                 )
             except Exception as exc:  # noqa: BLE001 - remote errors are retried uniformly
                 error = exc
@@ -995,7 +1158,7 @@ class DownloadEngine:
             0,
             time.monotonic() - started,
             attempts,
-            error=str(error),
+            error=redact_error(error),
         )
 
     @staticmethod
@@ -1064,6 +1227,7 @@ class DownloadEngine:
         failed = sum("success" not in values and "failed" in values for values in statuses.values())
         skipped = sum(values == {"skipped"} for values in statuses.values())
         byte_count = sum(item.bytes_downloaded for item in results)
+        retained_bytes = sum(item.retained_bytes for item in results)
         latest = monitor.latest
         return RunSummary(
             run_id=run_id,
@@ -1076,6 +1240,10 @@ class DownloadEngine:
             elapsed_seconds=elapsed,
             samples_per_second=succeeded / elapsed if elapsed else 0.0,
             bandwidth_mib_per_second=byte_count / (1024**2) / elapsed if elapsed else 0.0,
+            retained_bytes=retained_bytes,
+            useful_bandwidth_mib_per_second=(
+                retained_bytes / (1024**2) / elapsed if elapsed else 0.0
+            ),
             completed_eecu_seconds=latest.completed_seconds if latest else None,
             in_progress_eecu_seconds=latest.in_progress_seconds if latest else None,
             stopped_by_eecu_budget=stopped,
@@ -1095,6 +1263,7 @@ class DownloadEngine:
         completed_ids = {item.sample_id for item in results}
         successful = len({item.sample_id for item in results if item.status == "success"})
         bytes_downloaded = sum(item.bytes_downloaded for item in results)
+        retained_bytes = sum(item.retained_bytes for item in results)
         completion_rate = len(completed_ids) / elapsed
         eta = (total_samples - len(completed_ids)) / completion_rate if completion_rate else None
         eecu = monitor.latest
@@ -1107,7 +1276,7 @@ class DownloadEngine:
             )
         LOGGER.info(
             "progress=%d/%d success=%d elapsed=%.1fs eta=%s samples/s=%.3f "
-            "bandwidth=%.3f MiB/s "
+            "bandwidth=%.3f MiB/s useful_bandwidth=%.3f MiB/s "
             "reported_eecu_completed=%s reported_eecu_in_progress=%s%s",
             len(completed_ids),
             total_samples,
@@ -1116,6 +1285,7 @@ class DownloadEngine:
             f"{eta:.1f}s" if eta is not None else "n/a",
             successful / elapsed,
             bytes_downloaded / (1024**2) / elapsed,
+            retained_bytes / (1024**2) / elapsed,
             f"{eecu.completed_seconds:.2f}" if eecu is not None else "unavailable",
             f"{eecu.in_progress_seconds:.2f}" if eecu is not None else "unavailable",
             catalog_suffix,

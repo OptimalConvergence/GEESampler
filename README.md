@@ -23,7 +23,8 @@ python -m pip install -e '.[all,dev]'
 ```
 
 Copy `.env.example` into your own shell or secret manager. Never place a service
-account JSON file in this repository.
+account JSON file in this repository. JSON keys are rejected unless their Unix
+permissions are owner-only (`chmod 600 /secure/path/key.json`).
 
 ## Authentication and network
 
@@ -40,6 +41,53 @@ auth:
 The package does not launch or reconfigure VPN software. It honors the standard
 `HTTP_PROXY` and `HTTPS_PROXY` variables; on the development machine the existing
 Mihomo service is available at `http://127.0.0.1:7890`.
+
+### Multiple credential profiles
+
+Independent OS processes can run account-isolated Earth Engine clients while a
+parent scheduler groups nearby samples by half-degree cell and month, balances
+load, and retries transient worker failures on a healthy profile:
+
+```yaml
+accounts:
+  - name: primary
+    workers: 8
+    auth:
+      project: ${GEE_PROJECT}
+      high_volume: true
+  - name: secondary
+    workers: 8
+    auth:
+      project: ${GEE_PROJECT_SECONDARY}
+      service_account: ${GEE_SERVICE_ACCOUNT_SECONDARY}
+      key_file: ${GEE_KEY_FILE_SECONDARY}
+      high_volume: true
+
+distributed:
+  enabled: true
+  max_inflight_per_project: 16
+  failover_attempts: 1
+```
+
+See `examples/configs/distributed.example.yaml` for a runnable template. Profile
+names—not account identifiers—are written to aggregate metrics. Credentials stay
+outside run artifacts, error messages redact credential-shaped values, and each
+process has its own authenticated client and HTTP connection pool.
+
+This feature is for legitimate workload isolation and reliability. It does not
+increase quota when profiles share a Cloud project: project quotas and EECU are
+shared, so `max_inflight_per_project` is enforced across those profiles. Do not
+use multiple accounts or projects to circumvent Earth Engine quotas or access
+restrictions. Prefer short-lived impersonated credentials when that
+authentication path becomes available; static JSON is supported for the current
+local deployment only.
+
+For read and compute sampling, each service identity needs project-level Earth
+Engine Resource Viewer (`roles/earthengine.viewer`) and Service Usage Consumer
+(`roles/serviceusage.serviceUsageConsumer`). Use Earth Engine Resource Writer
+only if the workload also creates or modifies EE assets. Cloud Monitoring Viewer
+is additionally needed for EECU telemetry. See Google's
+[Earth Engine access-control guide](https://developers.google.com/earth-engine/guides/access_control).
 
 ## Python API
 
@@ -137,11 +185,14 @@ date interval was queried. The database stores only public scene metadata and
 patch-quality results—never credentials, authorization headers, or service-account
 contents.
 
-The default hybrid policy first applies the scene-wide metadata cloud ceiling,
-then downloads an internal uint8 Cloud Score+ clear band with the requested
-pixels. Clear fraction is evaluated locally, rejected temporary patches are
-discarded, and the next date-ranked scene is tried. Accepted output retains only
-the requested bands. Install the `geo` extra for this raster validation path.
+The production default `hybrid_inline` policy first applies the scene-wide
+metadata cloud ceiling, then downloads an internal uint8 Cloud Score+ clear band
+with the requested pixels. `hybrid_probe` instead requests that one-byte QA band
+first and downloads the full masked multispectral patch only after acceptance;
+this is preferable when metadata admits many locally cloudy candidates.
+`metadata_only` uses no Cloud Score and is the deliberately cheaper benchmark
+baseline. Clear-fraction decisions are cached per grid, scene, and QA policy.
+Install the `geo` extra for either Cloud Score validation path.
 
 ## EECU progress and guards
 
@@ -153,9 +204,10 @@ workload tag. If the caller can read Cloud Monitoring, GEESampler polls:
   EECU-seconds).
 
 The monitoring identity needs permission to read project time series (for
-example, the Cloud Monitoring Viewer role). When no separate
-`GOOGLE_APPLICATION_CREDENTIALS` is set, service-account configurations reuse
-their GEE key for monitoring.
+example, the Cloud Monitoring Viewer role). Cloud Monitoring uses the process's
+Application Default Credentials. This keeps the Earth Engine service-account key
+isolated from telemetry; grant the monitoring identity read access separately if
+EECU progress is required.
 
 Example guard:
 
@@ -220,17 +272,27 @@ geesampler validate image.tif preview.png --mask mask.tif
 ```
 
 `geesampler.benchmark.staged_benchmark_patch_downloads` first screens the same
-samples across
-standard/high-volume endpoints, 128/256/336/512 patch sizes, 4/8/16/24/32
-download threads, metadata workers, cloud policies, and grouped/random scheduling.
+samples across standard/high-volume endpoints, 128/256/336/512/768/1024/1536
+patch sizes, 4/8/16/24/32 download threads, and all three cloud policies.
 It retains four complementary configurations, then runs 128 samples with three
 repetitions per retained case. It writes raw and aggregated CSV files
-plus a static comparison of samples/s, payload MiB/s, reported EECU/sample, and
-pixel-request p95 latency. Cold catalog synchronization with 1/2/4 metadata
+plus a static comparison of samples/s, wire and retained-output MiB/s,
+megapixels/s, reported EECU/sample, and pixel-request p95 latency. Cold catalog synchronization with 1/2/4 metadata
 workers is written separately to `catalog_worker_benchmark.csv`; every timed
 pixel case receives an identical warm metadata catalog and an empty patch-quality
-cache. Payload bandwidth is downloaded bytes divided by wall time; it is
-intentionally not whole-machine interface traffic.
+cache. `benchmark_account_scaling` runs the fair 1×8, 1×16, and 2×8 profile
+matrix. Benchmark scheduling stops after 100 reported EECU-hours by default.
+
+Wire bandwidth is downloaded bytes divided by wall time; useful bandwidth counts
+only retained output bytes. A larger patch often raises wire MiB/s by amortizing
+request overhead, but it is not automatically more efficient: compare samples/s,
+megapixels/s, useful bandwidth, tail latency, and EECU per success. The estimator
+rejects cases above the 48 MiB uncompressed `computePixels` request limit. A live
+six-band S2 request at 1792 was rejected by Earth Engine at 57,802,752 bytes;
+1536 completed below the limit and is therefore the largest default case. The
+estimate is intentionally conservative because preprocessing can promote pixel
+types. These metrics measure GEESampler payloads rather than whole-machine
+interface traffic.
 
 Run the included tuning trial and refresh delayed EECU values afterward:
 

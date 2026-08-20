@@ -7,17 +7,20 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from statistics import median
 from typing import Any
 
 from .auth import initialize_earth_engine
 from .catalog import S2SceneCatalog
-from .config import SamplerConfig
+from .config import DistributedRunConfig, SamplerConfig, load_callable
+from .distributed import DistributedSampler
 from .engine import DownloadEngine, make_workload_tag
 from .models import DEFAULT_SCENE_SELECTION, PatchGrid, RunSummary, SampleRecord, SceneSelection
 from .monitoring import CloudEECUReader
 from .resolver import S2CatalogResolver
+from .sampler import Sampler
 from .visualize import plot_benchmark
 
 
@@ -32,19 +35,47 @@ class BenchmarkCase:
     cloud_mode: str | None = None
 
 
+@dataclass(frozen=True)
+class AccountScalingCase:
+    name: str
+    profile_count: int
+    workers_per_profile: int
+
+
+DEFAULT_ACCOUNT_CASES = (
+    AccountScalingCase("one-profile-w8", 1, 8),
+    AccountScalingCase("one-profile-w16", 1, 16),
+    AccountScalingCase("two-profiles-w8-each", 2, 8),
+)
+
+
 DEFAULT_CASES = (
     BenchmarkCase("standard-336-w8", 336, 8, False),
-    BenchmarkCase("highvolume-336-w8", 336, 8, True),
-    BenchmarkCase("highvolume-128-w8", 128, 8, True),
-    BenchmarkCase("highvolume-256-w8", 256, 8, True),
-    BenchmarkCase("highvolume-512-w8", 512, 8, True),
-    BenchmarkCase("highvolume-336-w4", 336, 4, True),
-    BenchmarkCase("highvolume-336-w16", 336, 16, True),
-    BenchmarkCase("highvolume-336-w24", 336, 24, True),
-    BenchmarkCase("highvolume-336-w32", 336, 32, True),
-    BenchmarkCase("highvolume-336-w16-random", 336, 16, True, False),
-    BenchmarkCase("highvolume-336-w16-metadata-only", 336, 16, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-128-w16", 128, 16, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-256-w16", 256, 16, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-336-w16", 336, 16, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-512-w16", 512, 16, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-768-w16", 768, 16, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-1024-w16", 1024, 16, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-1536-w16", 1536, 16, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-336-w4", 336, 4, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-336-w8", 336, 8, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-336-w24", 336, 24, True, True, 2, "metadata_only"),
+    BenchmarkCase("metadata-336-w32", 336, 32, True, True, 2, "metadata_only"),
+    BenchmarkCase("hybrid-probe-336-w16", 336, 16, True, True, 2, "hybrid_probe"),
+    BenchmarkCase("hybrid-inline-336-w16", 336, 16, True, True, 2, "hybrid_inline"),
 )
+
+
+def estimate_uncompressed_mib(
+    patch_size: int,
+    band_count: int,
+    *,
+    bytes_per_band: int = 3,
+    internal_bands: int = 0,
+) -> float:
+    """Estimate the computePixels uncompressed payload against its 48 MiB limit."""
+    return patch_size**2 * (band_count + internal_bands) * bytes_per_band / (1024**2)
 
 
 def benchmark_patch_downloads(
@@ -59,12 +90,30 @@ def benchmark_patch_downloads(
     repetitions: int = 3,
     sample_count: int = 128,
     benchmark_id: str | None = None,
+    bytes_per_band: int = 3,
+    max_uncompressed_mib: float = 48.0,
+    max_total_eecu_hours: float = 100.0,
 ) -> Path:
     samples = list(records)[:sample_count]
     if not samples:
         raise ValueError("No benchmark samples")
     if not cases:
         raise ValueError("No benchmark cases")
+    for case in cases:
+        cloud_mode = case.cloud_mode or (
+            config.catalog.resolver.cloud_mode if config.catalog is not None else "metadata_only"
+        )
+        estimated = estimate_uncompressed_mib(
+            case.patch_size,
+            len(bands),
+            bytes_per_band=bytes_per_band,
+            internal_bands=int(cloud_mode == "hybrid_inline"),
+        )
+        if estimated > max_uncompressed_mib:
+            raise ValueError(
+                f"Benchmark case {case.name} estimates {estimated:.1f} MiB uncompressed, "
+                f"above the {max_uncompressed_mib:.1f} MiB computePixels limit"
+            )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     benchmark_id = (
@@ -73,7 +122,12 @@ def benchmark_patch_downloads(
     base_catalog_path = None
     if config.catalog is not None:
         base_catalog_path = output_dir / "catalogs" / f"{benchmark_id}-base.sqlite"
-        metadata_ee = initialize_earth_engine(replace(config.auth, high_volume=False))
+        if config.catalog.path.is_file():
+            _copy_catalog(config.catalog.path, base_catalog_path)
+            _clear_catalog_quality(base_catalog_path)
+        metadata_ee = initialize_earth_engine(
+            replace(config.auth, high_volume=False), pool_size=config.run.workers
+        )
         prefill = S2CatalogResolver(
             S2SceneCatalog(base_catalog_path),
             ee_module=metadata_ee,
@@ -97,11 +151,12 @@ def benchmark_patch_downloads(
             json.dumps(prefill_payload, indent=2, sort_keys=True), encoding="utf-8"
         )
     raw_rows: list[dict[str, Any]] = []
+    reported_eecu_seconds = 0.0
     for case in cases:
         grid = PatchGrid(case.patch_size, 10)
         collection_builder = collection_builder_factory(grid)
         auth = replace(config.auth, high_volume=case.high_volume)
-        ee = initialize_earth_engine(auth)
+        ee = initialize_earth_engine(auth, pool_size=case.workers)
         effective_case = replace(
             case,
             metadata_workers=case.metadata_workers
@@ -118,6 +173,10 @@ def benchmark_patch_downloads(
             workers=case.workers,
         )
         for repetition in range(repetitions):
+            if reported_eecu_seconds >= max_total_eecu_hours * 3600:
+                raise RuntimeError(
+                    f"Benchmark stopped at the {max_total_eecu_hours:g} EECU-hour ceiling"
+                )
             resolver = None
             if config.catalog is not None and base_catalog_path is not None:
                 case_catalog_path = (
@@ -145,6 +204,8 @@ def benchmark_patch_downloads(
                 run_id=f"{benchmark_id}-r{repetition + 1}-{case.name}",
             )
             raw_rows.append(_row(effective_case, repetition + 1, summary))
+            if summary.completed_eecu_seconds is not None:
+                reported_eecu_seconds += summary.completed_eecu_seconds
     raw_path = output_dir / "benchmark_runs.csv"
     _write_rows(raw_path, raw_rows)
     aggregate_path = output_dir / "benchmark_summary.csv"
@@ -153,10 +214,151 @@ def benchmark_patch_downloads(
     return aggregate_path
 
 
+def benchmark_account_scaling(
+    config: SamplerConfig,
+    records: Iterable[SampleRecord],
+    collection_builder: str,
+    *,
+    bands: Sequence[str],
+    output_dir: str | Path,
+    builder_kwargs: Mapping[str, Any] | None = None,
+    grid: PatchGrid | None = None,
+    selection: SceneSelection = DEFAULT_SCENE_SELECTION,
+    cases: Sequence[AccountScalingCase] = DEFAULT_ACCOUNT_CASES,
+    repetitions: int = 3,
+    sample_count: int = 128,
+    max_total_eecu_hours: float = 100.0,
+) -> Path:
+    """Compare 1×8, 1×16, and 2×8 with identical samples and preprocessing."""
+    samples = list(records)[:sample_count]
+    profiles = tuple(profile for profile in config.accounts if profile.enabled)
+    if not samples:
+        raise ValueError("No account-scaling benchmark samples")
+    if not profiles:
+        raise ValueError("Account-scaling benchmark requires configured account profiles")
+    if any(case.profile_count > len(profiles) for case in cases):
+        raise ValueError("Account-scaling case requests more profiles than are configured")
+    grid = grid or PatchGrid()
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    kwargs = dict(builder_kwargs or {})
+    reported_eecu_seconds = 0.0
+    rows: list[dict[str, Any]] = []
+    benchmark_id = datetime.now(timezone.utc).strftime("%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    for case in cases:
+        selected = tuple(
+            replace(profile, workers=case.workers_per_profile)
+            for profile in profiles[: case.profile_count]
+        )
+        run = replace(
+            config.run,
+            output_dir=output_dir / "runs" / case.name,
+            workers=case.workers_per_profile,
+        )
+        for repetition in range(1, repetitions + 1):
+            if reported_eecu_seconds >= max_total_eecu_hours * 3600:
+                raise RuntimeError(
+                    f"Benchmark stopped at the {max_total_eecu_hours:g} EECU-hour ceiling"
+                )
+            run_id = f"{benchmark_id}-r{repetition}-{case.name}"
+            if case.profile_count == 1:
+                case_config = replace(
+                    config,
+                    auth=selected[0].auth,
+                    run=run,
+                    accounts=(),
+                    distributed=DistributedRunConfig(),
+                )
+                summary = Sampler(case_config).download_patch_series(
+                    samples,
+                    partial(load_callable(collection_builder), **kwargs),
+                    bands=bands,
+                    grid=grid,
+                    selection=selection,
+                    scenario="account-benchmark",
+                    run_id=run_id,
+                )
+            else:
+                case_config = replace(
+                    config,
+                    auth=selected[0].auth,
+                    run=run,
+                    accounts=selected,
+                    distributed=replace(config.distributed, enabled=True),
+                )
+                summary = DistributedSampler(case_config).download_patch_series(
+                    samples,
+                    collection_builder,
+                    builder_kwargs=kwargs,
+                    bands=bands,
+                    grid=grid,
+                    selection=selection,
+                    scenario="account-benchmark",
+                    run_id=run_id,
+                )
+            if summary.completed_eecu_seconds is not None:
+                reported_eecu_seconds += summary.completed_eecu_seconds
+            rows.append(
+                {
+                    "case": case.name,
+                    "repetition": repetition,
+                    "run_id": summary.run_id,
+                    "workload_tag": summary.workload_tag,
+                    "patch_size": grid.size,
+                    "workers": case.profile_count * case.workers_per_profile,
+                    "profiles": case.profile_count,
+                    "workers_per_profile": case.workers_per_profile,
+                    "endpoint": "mixed",
+                    "successful": summary.succeeded,
+                    "failed": summary.failed,
+                    "elapsed_seconds": summary.elapsed_seconds,
+                    "bandwidth_mib_per_second": summary.bandwidth_mib_per_second,
+                    "useful_bandwidth_mib_per_second": (
+                        summary.useful_bandwidth_mib_per_second
+                    ),
+                    "wire_efficiency": (
+                        summary.retained_bytes / summary.bytes_downloaded
+                        if summary.bytes_downloaded
+                        else 0
+                    ),
+                    "samples_per_second": summary.samples_per_second,
+                    "megapixels_per_second": (
+                        summary.succeeded
+                        * grid.size**2
+                        / 1_000_000
+                        / summary.elapsed_seconds
+                        if summary.elapsed_seconds
+                        else 0
+                    ),
+                    "completed_eecu_seconds": summary.completed_eecu_seconds or "",
+                    "eecu_per_success": (
+                        summary.completed_eecu_seconds / summary.succeeded
+                        if summary.completed_eecu_seconds is not None and summary.succeeded
+                        else ""
+                    ),
+                    "compute_pixels_p95_seconds": _timing_percentile(
+                        summary, "compute_pixels", 0.95
+                    ),
+                }
+            )
+    raw_path = output_dir / "account_scaling_runs.csv"
+    _write_rows(raw_path, rows)
+    summary_path = output_dir / "account_scaling_summary.csv"
+    _write_rows(summary_path, _aggregate(rows))
+    plot_benchmark(summary_path, output_dir / "account_scaling_comparison.png")
+    return summary_path
+
+
 def _copy_catalog(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(source) as source_db, sqlite3.connect(destination) as destination_db:
         source_db.backup(destination_db)
+
+
+def _clear_catalog_quality(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM patch_quality")
 
 
 def _row(case: BenchmarkCase, repetition: int, summary: RunSummary) -> dict[str, Any]:
@@ -175,7 +377,18 @@ def _row(case: BenchmarkCase, repetition: int, summary: RunSummary) -> dict[str,
         "failed": summary.failed,
         "elapsed_seconds": summary.elapsed_seconds,
         "bandwidth_mib_per_second": summary.bandwidth_mib_per_second,
+        "useful_bandwidth_mib_per_second": summary.useful_bandwidth_mib_per_second,
+        "wire_efficiency": (
+            summary.retained_bytes / summary.bytes_downloaded
+            if summary.bytes_downloaded
+            else 0
+        ),
         "samples_per_second": summary.samples_per_second,
+        "megapixels_per_second": (
+            summary.succeeded * case.patch_size**2 / 1_000_000 / summary.elapsed_seconds
+            if summary.elapsed_seconds
+            else 0
+        ),
         "completed_eecu_seconds": (
             summary.completed_eecu_seconds if summary.completed_eecu_seconds is not None else ""
         ),
@@ -275,8 +488,13 @@ def _aggregate(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                 "median_bandwidth_mib_per_second": median(
                     float(row["bandwidth_mib_per_second"]) for row in group
                 ),
+                "useful_bandwidth_mib_per_second": _mean_present(
+                    group, "useful_bandwidth_mib_per_second"
+                ),
+                "wire_efficiency": _mean_present(group, "wire_efficiency"),
                 "samples_per_second": sum(float(row["samples_per_second"]) for row in group)
                 / len(group),
+                "megapixels_per_second": _mean_present(group, "megapixels_per_second"),
                 "eecu_per_success": sum(eecu) / len(eecu) if eecu else "nan",
                 "catalog_hit_rate": _mean_present(group, "catalog_hit_rate"),
                 "metadata_queries": _mean_present(group, "metadata_queries"),
@@ -386,7 +604,9 @@ def benchmark_catalog_sync(
         raise ValueError("No catalog benchmark samples")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ee = initialize_earth_engine(replace(config.auth, high_volume=False))
+    ee = initialize_earth_engine(
+        replace(config.auth, high_volume=False), pool_size=max(metadata_workers)
+    )
     rows = []
     benchmark_id = datetime.now(timezone.utc).strftime("%H%M%S") + "-" + uuid.uuid4().hex[:4]
     for workers in metadata_workers:

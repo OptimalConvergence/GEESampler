@@ -135,6 +135,7 @@ class TaskResult:
     sample_properties: Mapping[str, Any] = field(default_factory=dict)
     clear_fraction: float | None = None
     timings: Mapping[str, float] = field(default_factory=dict)
+    retained_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -152,6 +153,8 @@ class RunSummary:
     elapsed_seconds: float
     samples_per_second: float
     bandwidth_mib_per_second: float
+    retained_bytes: int = 0
+    useful_bandwidth_mib_per_second: float = 0.0
     completed_eecu_seconds: float | None = None
     in_progress_eecu_seconds: float | None = None
     stopped_by_eecu_budget: bool = False

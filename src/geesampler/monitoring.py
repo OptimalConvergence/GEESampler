@@ -137,10 +137,10 @@ class EECUMonitor:
             self._append(snapshot)
             return snapshot
         except Exception as exc:  # noqa: BLE001 - optional telemetry must not crash downloads
-            self.unavailable_error = str(exc)
+            self.unavailable_error = type(exc).__name__
             if self.config.required:
                 self.hard_limit_reached = True
-            LOGGER.warning("Unable to read EECU metrics: %s", exc)
+            LOGGER.warning("Unable to read EECU metrics (%s)", type(exc).__name__)
             return None
 
     def _append(self, snapshot: EECUSnapshot) -> None:
