@@ -3,6 +3,13 @@ auth:
   service_account: ${GEE_SERVICE_ACCOUNT}
   key_file: ${GEE_KEY_FILE}
 proxy_url: ${HTTPS_PROXY:-}
+catalog:
+  enabled: true
+  path: ${GEESAMPLER_DATA_ROOT:-./geesampler-output}/catalog/sentinel2.sqlite
+  mode: read_through
+  metadata_workers: 2
+  metadata_cloud_max: 20
+  cloud: {mode: hybrid_inline, band: cs_cdf, threshold: 0.60, min_clear_fraction: 0.80}
 run:
   output_dir: ${GEESAMPLER_DATA_ROOT:-./geesampler-output}/runs/gedi
   workers: 8

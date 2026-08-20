@@ -73,6 +73,32 @@ def test_yaml_environment_expansion(tmp_path, monkeypatch):
     assert load_callable("geesampler.recipes.sentinel2:polygon_mask").__name__ == "polygon_mask"
 
 
+def test_yaml_catalog_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_GEE_PROJECT", "project-x")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+auth:
+  project: ${TEST_GEE_PROJECT}
+run:
+  output_dir: ./out
+  monitoring: {enabled: false}
+catalog:
+  enabled: true
+  path: ./cache/s2.sqlite
+  metadata_cloud_max: 12
+  cloud: {mode: metadata_only, threshold: 0.65}
+""",
+        encoding="utf-8",
+    )
+    config = SamplerConfig.from_yaml(config_path)
+    assert config.catalog is not None
+    assert config.catalog.path.name == "s2.sqlite"
+    assert config.catalog.resolver.metadata_cloud_max == 12
+    assert config.catalog.resolver.cloud_mode == "metadata_only"
+    assert config.catalog.resolver.qa_threshold == 0.65
+
+
 def test_sample_rejects_unsupported_geometry():
     with pytest.raises(ValueError, match="Unsupported"):
         SampleRecord("x", {"type": "LineString", "coordinates": []})

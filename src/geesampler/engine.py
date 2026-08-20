@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .catalog import SceneRecord
 from .grid import compute_grid
 from .models import (
     DEFAULT_PATCH_GRID,
@@ -161,10 +162,20 @@ class DownloadEngine:
         grid: PatchGrid = DEFAULT_PATCH_GRID,
         selection: SceneSelection = DEFAULT_SCENE_SELECTION,
         mask_builder: MaskBuilder | None = None,
+        scene_resolver: Any | None = None,
         scenario: str = "patches",
         run_id: str | None = None,
     ) -> RunSummary:
+        input_started = time.monotonic()
         samples = list(records)
+        input_seconds = time.monotonic() - input_started
+
+        def prepare(items: Sequence[SampleRecord], tag: str) -> Sequence[SampleRecord]:
+            if scene_resolver is None:
+                return items
+            scene_resolver.prepare(items, grid=grid, selection=selection, workload_tag=tag)
+            return scene_resolver.order_samples(items)
+
         return self._run(
             samples,
             scenario,
@@ -179,7 +190,12 @@ class DownloadEngine:
                 grid,
                 selection,
                 mask_builder,
+                scene_resolver,
             ),
+            prepare=prepare,
+            metrics_provider=scene_resolver.stats if scene_resolver is not None else None,
+            started_at=input_started,
+            initial_metrics={"input_normalization_seconds": input_seconds},
         )
 
     def download_point_series(
@@ -189,19 +205,46 @@ class DownloadEngine:
         *,
         bands: Sequence[str],
         scale: float = 10.0,
+        selection: SceneSelection = DEFAULT_SCENE_SELECTION,
+        scene_resolver: Any | None = None,
         scenario: str = "points",
         run_id: str | None = None,
     ) -> RunSummary:
+        input_started = time.monotonic()
         samples = list(records)
+        input_seconds = time.monotonic() - input_started
+
+        def prepare(items: Sequence[SampleRecord], tag: str) -> Sequence[SampleRecord]:
+            if scene_resolver is None:
+                return items
+            scene_resolver.prepare(
+                items,
+                grid=PatchGrid(size=1, scale=scale),
+                selection=selection,
+                workload_tag=tag,
+            )
+            return scene_resolver.order_samples(items)
+
         return self._run(
             samples,
             scenario,
             run_id,
             lambda sample, tag, ledger, run_dir: [
                 self._point_worker(
-                    sample, tag, ledger, run_dir, collection_builder, tuple(bands), scale
+                    sample,
+                    tag,
+                    ledger,
+                    run_dir,
+                    collection_builder,
+                    tuple(bands),
+                    scale,
+                    scene_resolver,
                 )
             ],
+            prepare=prepare,
+            metrics_provider=scene_resolver.stats if scene_resolver is not None else None,
+            started_at=input_started,
+            initial_metrics={"input_normalization_seconds": input_seconds},
         )
 
     def _run(
@@ -210,6 +253,11 @@ class DownloadEngine:
         scenario: str,
         run_id: str | None,
         worker: Callable[[SampleRecord, str, TaskLedger, Path], list[TaskResult]],
+        *,
+        prepare: Callable[[Sequence[SampleRecord], str], Sequence[SampleRecord]] | None = None,
+        metrics_provider: Callable[[], Any] | None = None,
+        started_at: float | None = None,
+        initial_metrics: Mapping[str, Any] | None = None,
     ) -> RunSummary:
         run_id = (
             run_id
@@ -218,6 +266,11 @@ class DownloadEngine:
         workload_tag = make_workload_tag(self.config.workload_prefix, scenario, run_id)
         run_dir = self.config.output_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        run_started = started_at if started_at is not None else time.monotonic()
+        planning_started = time.monotonic()
+        if prepare is not None:
+            samples = list(prepare(samples, workload_tag))
+        planning_seconds = time.monotonic() - planning_started
         ledger = TaskLedger(run_dir / "ledger.sqlite")
         recorder = MetricsRecorder(run_dir / "metrics.jsonl")
         results: list[TaskResult] = []
@@ -243,11 +296,18 @@ class DownloadEngine:
             run_dir / "eecu.jsonl",
             completed_samples,
         )
-        started = time.monotonic()
+        started = run_started
         monitor.start()
         stopped_by_budget = False
         pending = iter(samples)
         futures: dict[Future[list[TaskResult]], SampleRecord] = {}
+
+        def execute(sample: SampleRecord, submitted_at: float) -> list[TaskResult]:
+            queue_wait = time.monotonic() - submitted_at
+            return [
+                replace(item, timings={"queue_wait": queue_wait, **item.timings})
+                for item in worker(sample, workload_tag, ledger, run_dir)
+            ]
 
         def submit_one(pool: ThreadPoolExecutor) -> bool:
             nonlocal stopped_by_budget
@@ -258,7 +318,7 @@ class DownloadEngine:
                 sample = next(pending)
             except StopIteration:
                 return False
-            futures[pool.submit(worker, sample, workload_tag, ledger, run_dir)] = sample
+            futures[pool.submit(execute, sample, time.monotonic())] = sample
             return True
 
         try:
@@ -298,7 +358,13 @@ class DownloadEngine:
                         for item in batch:
                             ledger.record(item)
                             recorder.append(item)
-                        self._log_progress(results, len(samples), started, monitor)
+                        self._log_progress(
+                            results,
+                            len(samples),
+                            started,
+                            monitor,
+                            metrics_provider() if metrics_provider is not None else None,
+                        )
                         submit_one(pool)
         finally:
             monitor.stop()
@@ -322,11 +388,38 @@ class DownloadEngine:
                 results.append(result)
                 recorder.append(result)
         elapsed = time.monotonic() - started
+        catalog_metrics: dict[str, Any] = dict(initial_metrics or {})
+        catalog_metrics["planning_seconds"] = planning_seconds
+        if metrics_provider is not None:
+            snapshot = metrics_provider()
+            catalog_metrics.update(
+                asdict(snapshot) if hasattr(snapshot, "__dataclass_fields__") else {}
+            )
+            if hasattr(snapshot, "catalog_hit_rate"):
+                catalog_metrics["catalog_hit_rate"] = snapshot.catalog_hit_rate
         summary = self._summary(
-            run_id, workload_tag, len(samples), results, elapsed, monitor, stopped_by_budget
+            run_id,
+            workload_tag,
+            len(samples),
+            results,
+            elapsed,
+            monitor,
+            stopped_by_budget,
+            catalog_metrics,
         )
         (run_dir / "summary.json").write_text(
             json.dumps(summary.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (run_dir / "profile.json").write_text(
+            json.dumps(
+                {
+                    "catalog": catalog_metrics,
+                    "steps": self._timing_summary(results),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
         )
         self._write_manifest(run_dir / "manifest.csv", results)
         return summary
@@ -342,12 +435,31 @@ class DownloadEngine:
         grid_spec: PatchGrid,
         selection: SceneSelection,
         mask_builder: MaskBuilder | None,
+        scene_resolver: Any | None,
     ) -> list[TaskResult]:
         started = time.monotonic()
         if sample.date is None:
             raise ValueError(f"Patch sample {sample.sample_id} has no target date")
+        collection_started = time.monotonic()
         collection = collection_builder(sample)
+        collection_seconds = time.monotonic() - collection_started
+        if scene_resolver is not None:
+            return self._patch_worker_resolved(
+                sample,
+                workload_tag,
+                ledger,
+                run_dir,
+                collection,
+                bands,
+                grid_spec,
+                selection,
+                mask_builder,
+                scene_resolver,
+                collection_seconds,
+            )
+        selection_started = time.monotonic()
         selected, metadata = self._select_scenes(collection, sample.date, selection, workload_tag)
+        selection_seconds = time.monotonic() - selection_started
         if not metadata:
             return [
                 TaskResult(
@@ -413,8 +525,170 @@ class DownloadEngine:
                 mask_path if has_mask else None,
                 scene_id,
                 scene_date,
+                data_band_count=len(bands),
+                timings={
+                    "collection_builder": collection_seconds,
+                    "scene_selection": selection_seconds,
+                },
             )
             results.append(result)
+        return results
+
+    def _patch_worker_resolved(
+        self,
+        sample: SampleRecord,
+        workload_tag: str,
+        ledger: TaskLedger,
+        run_dir: Path,
+        collection: Any,
+        bands: tuple[str, ...],
+        grid_spec: PatchGrid,
+        selection: SceneSelection,
+        mask_builder: MaskBuilder | None,
+        scene_resolver: Any,
+        collection_seconds: float,
+    ) -> list[TaskResult]:
+        candidates: list[SceneRecord] = scene_resolver.candidates(sample)
+        if not candidates:
+            return [
+                TaskResult(
+                    task_id=f"{_safe_name(sample.sample_id)}-no-scene",
+                    sample_id=sample.sample_id,
+                    status="failed",
+                    output_path=None,
+                    bytes_downloaded=0,
+                    elapsed_seconds=collection_seconds,
+                    attempts=1,
+                    error="No metadata-qualified scenes",
+                    timings={"collection_builder": collection_seconds},
+                )
+            ]
+        results: list[TaskResult] = []
+        rejected_bytes = 0
+        rejected_seconds = 0.0
+        rejected_attempts = 0
+        accepted = 0
+        computed_grid = compute_grid(sample.geometry, grid_spec)
+        for scene in candidates:
+            if accepted >= selection.max_scenes:
+                break
+            scene_date = scene.acquired_at.isoformat()
+            task_id = f"{_safe_name(sample.sample_id)}-{_safe_name(scene.scene_id)}"
+            output = (
+                run_dir
+                / "images"
+                / _safe_name(sample.sample_id)
+                / f"{accepted:03d}_{_safe_name(scene.scene_id)}.tif"
+            )
+            mask_path = (
+                run_dir
+                / "masks"
+                / _safe_name(sample.sample_id)
+                / f"{accepted:03d}_{_safe_name(scene.scene_id)}_mask.tif"
+            )
+            if ledger.status(task_id) == "success" and self._valid_file(output):
+                results.append(
+                    TaskResult(
+                        task_id,
+                        sample.sample_id,
+                        "skipped",
+                        str(output),
+                        0,
+                        0,
+                        0,
+                        scene_id=scene.scene_id,
+                        scene_date=scene_date,
+                    )
+                )
+                accepted += 1
+                continue
+            scene_filter_started = time.monotonic()
+            selected = collection.filter(self.ee.Filter.eq("system:index", scene.scene_id))
+            raw_image = self.ee.Image(selected.first())
+            image = raw_image.select(list(bands))
+            request_bands = list(bands)
+            has_mask = mask_builder is not None
+            if has_mask:
+                mask = self.ee.Image(mask_builder(sample)).rename("sample_mask").unmask(0).uint8()
+                image = image.addBands(mask)
+                request_bands.append("sample_mask")
+            cached_quality = scene_resolver.cached_quality(sample, scene)
+            validate_quality = scene_resolver.inline_quality and cached_quality is None
+            quality = None
+            if scene_resolver.inline_quality:
+                image, quality = scene_resolver.apply_inline_quality(
+                    image, include_band=validate_quality
+                )
+            if quality is not None:
+                image = image.addBands(quality)
+                request_bands.append(scene_resolver.internal_quality_band)
+            scene_filter_seconds = time.monotonic() - scene_filter_started
+            result = self._download_pixels(
+                task_id,
+                sample.sample_id,
+                image,
+                request_bands,
+                computed_grid.to_ee(),
+                workload_tag,
+                output,
+                mask_path if has_mask else None,
+                scene.scene_id,
+                scene_date,
+                data_band_count=len(bands),
+                quality_required=validate_quality,
+                min_clear_fraction=scene_resolver.min_clear_fraction,
+                timings={
+                    "collection_builder": collection_seconds,
+                    "scene_filter": scene_filter_seconds,
+                },
+            )
+            if validate_quality and result.clear_fraction is not None:
+                quality_accepted = result.error != "quality_rejected"
+                scene_resolver.record_quality(
+                    sample, scene, result.clear_fraction, quality_accepted
+                )
+                if not quality_accepted:
+                    rejected_bytes += result.bytes_downloaded
+                    rejected_seconds += result.elapsed_seconds
+                    rejected_attempts += result.attempts
+                    continue
+            if result.status == "success":
+                if rejected_bytes or rejected_seconds:
+                    result = replace(
+                        result,
+                        bytes_downloaded=result.bytes_downloaded + rejected_bytes,
+                        elapsed_seconds=result.elapsed_seconds + rejected_seconds,
+                        attempts=result.attempts + rejected_attempts,
+                        timings={
+                            **result.timings,
+                            "quality_rejected_downloads": rejected_seconds,
+                        },
+                    )
+                    rejected_bytes = 0
+                    rejected_seconds = 0.0
+                    rejected_attempts = 0
+                results.append(result)
+                accepted += 1
+            else:
+                results.append(result)
+                break
+        if accepted == 0 and not results:
+            results.append(
+                TaskResult(
+                    task_id=f"{_safe_name(sample.sample_id)}-no-clear-scene",
+                    sample_id=sample.sample_id,
+                    status="failed",
+                    output_path=None,
+                    bytes_downloaded=rejected_bytes,
+                    elapsed_seconds=rejected_seconds + collection_seconds,
+                    attempts=max(1, rejected_attempts),
+                    error="No scene met inline cloud quality",
+                    timings={
+                        "collection_builder": collection_seconds,
+                        "quality_rejected_downloads": rejected_seconds,
+                    },
+                )
+            )
         return results
 
     def _select_scenes(
@@ -468,6 +742,11 @@ class DownloadEngine:
         mask_output: Path | None,
         scene_id: str,
         scene_date: str | None,
+        *,
+        data_band_count: int,
+        quality_required: bool = False,
+        min_clear_fraction: float = 0.0,
+        timings: Mapping[str, float] | None = None,
     ) -> TaskResult:
         output.parent.mkdir(parents=True, exist_ok=True)
         if mask_output:
@@ -475,6 +754,7 @@ class DownloadEngine:
         attempts = 0
         started = time.monotonic()
         error: Exception | None = None
+        base_timings = dict(timings or {})
         while attempts <= self.config.retries:
             attempts += 1
             temp = output.with_suffix(output.suffix + f".{uuid.uuid4().hex}.partial")
@@ -484,6 +764,7 @@ class DownloadEngine:
                 else None
             )
             try:
+                compute_started = time.monotonic()
                 payload = self.ee.data.computePixels(
                     {
                         "expression": image,
@@ -493,15 +774,51 @@ class DownloadEngine:
                         "workloadTag": workload_tag,
                     }
                 )
+                compute_seconds = time.monotonic() - compute_started
+                write_started = time.monotonic()
                 temp.write_bytes(payload)
-                if mask_output and mask_temp:
+                write_seconds = time.monotonic() - write_started
+                clear_fraction = None
+                local_started = time.monotonic()
+                if mask_output or quality_required:
                     data_temp = output.with_suffix(
                         output.suffix + f".{uuid.uuid4().hex}.data.partial"
                     )
-                    self._split_mask(temp, data_temp, mask_temp)
+                    clear_fraction, accepted = self._split_internal_bands(
+                        temp,
+                        data_temp,
+                        mask_temp,
+                        data_band_count=data_band_count,
+                        quality_required=quality_required,
+                        min_clear_fraction=min_clear_fraction,
+                    )
                     temp.unlink(missing_ok=True)
+                    if not accepted:
+                        data_temp.unlink(missing_ok=True)
+                        if mask_temp:
+                            mask_temp.unlink(missing_ok=True)
+                        return TaskResult(
+                            task_id,
+                            sample_id,
+                            "failed",
+                            None,
+                            len(payload),
+                            time.monotonic() - started,
+                            attempts,
+                            error="quality_rejected",
+                            scene_id=scene_id,
+                            scene_date=scene_date,
+                            clear_fraction=clear_fraction,
+                            timings={
+                                **base_timings,
+                                "compute_pixels": compute_seconds,
+                                "payload_write": write_seconds,
+                                "local_qa_and_split": time.monotonic() - local_started,
+                            },
+                        )
                     os.replace(data_temp, output)
-                    os.replace(mask_temp, mask_output)
+                    if mask_output and mask_temp:
+                        os.replace(mask_temp, mask_output)
                 else:
                     os.replace(temp, output)
                 elapsed = time.monotonic() - started
@@ -515,6 +832,13 @@ class DownloadEngine:
                     attempts,
                     scene_id=scene_id,
                     scene_date=scene_date,
+                    clear_fraction=clear_fraction,
+                    timings={
+                        **base_timings,
+                        "compute_pixels": compute_seconds,
+                        "payload_write": write_seconds,
+                        "local_qa_and_split": time.monotonic() - local_started,
+                    },
                 )
             except Exception as exc:  # noqa: BLE001 - remote errors are retried uniformly
                 error = exc
@@ -535,25 +859,46 @@ class DownloadEngine:
             error=str(error),
             scene_id=scene_id,
             scene_date=scene_date,
+            timings=base_timings,
         )
 
     @staticmethod
-    def _split_mask(combined: Path, image_output: Path, mask_output: Path) -> None:
+    def _split_internal_bands(
+        combined: Path,
+        image_output: Path,
+        mask_output: Path | None,
+        *,
+        data_band_count: int,
+        quality_required: bool,
+        min_clear_fraction: float,
+    ) -> tuple[float | None, bool]:
         try:
             import rasterio
         except ImportError as exc:  # pragma: no cover
             raise ImportError("Polygon masks require the 'geo' extra (rasterio)") from exc
         with rasterio.open(combined) as source:
-            if source.count < 2:
-                raise ValueError("Combined image does not contain data plus a mask band")
+            internal_count = int(mask_output is not None) + int(quality_required)
+            if source.count != data_band_count + internal_count:
+                raise ValueError(
+                    "Combined image band count does not match data and internal mask bands"
+                )
+            clear_fraction = None
+            if quality_required:
+                clear = source.read(source.count) > 0
+                clear_fraction = float(clear.mean())
+                if clear_fraction < min_clear_fraction:
+                    return clear_fraction, False
             data_profile = source.profile.copy()
-            data_profile.update(count=source.count - 1)
+            data_profile.update(count=data_band_count)
             with rasterio.open(image_output, "w", **data_profile) as destination:
-                destination.write(source.read(indexes=list(range(1, source.count))))
-            mask_profile = source.profile.copy()
-            mask_profile.update(count=1, dtype="uint8", nodata=0)
-            with rasterio.open(mask_output, "w", **mask_profile) as destination:
-                destination.write((source.read(source.count) > 0).astype("uint8"), 1)
+                destination.write(source.read(indexes=list(range(1, data_band_count + 1))))
+            if mask_output is not None:
+                mask_profile = source.profile.copy()
+                mask_profile.update(count=1, dtype="uint8", nodata=0)
+                mask_index = data_band_count + 1
+                with rasterio.open(mask_output, "w", **mask_profile) as destination:
+                    destination.write((source.read(mask_index) > 0).astype("uint8"), 1)
+            return clear_fraction, True
 
     def _point_worker(
         self,
@@ -564,6 +909,7 @@ class DownloadEngine:
         collection_builder: CollectionBuilder,
         bands: tuple[str, ...],
         scale: float,
+        scene_resolver: Any | None,
     ) -> TaskResult:
         task_id = f"{_safe_name(sample.sample_id)}-timeseries"
         output = run_dir / "timeseries" / f"{_safe_name(sample.sample_id)}.csv"
@@ -574,7 +920,22 @@ class DownloadEngine:
         attempts = 0
         error: Exception | None = None
         geometry = self.ee.Geometry(sample.geometry)
-        collection = collection_builder(sample).select(list(bands))
+        collection = collection_builder(sample)
+        if scene_resolver is not None:
+            scene_ids = [scene.scene_id for scene in scene_resolver.candidates(sample)]
+            if not scene_ids:
+                return TaskResult(
+                    task_id,
+                    sample.sample_id,
+                    "failed",
+                    None,
+                    0,
+                    time.monotonic() - started,
+                    1,
+                    error="No metadata-qualified scenes",
+                )
+            collection = collection.filter(self.ee.Filter.inList("system:index", scene_ids))
+        collection = collection.select(list(bands))
         while attempts <= self.config.retries:
             attempts += 1
             try:
@@ -657,7 +1018,33 @@ class DownloadEngine:
                 row["sample_properties"] = json.dumps(
                     row["sample_properties"], sort_keys=True, default=str
                 )
+                row["timings"] = json.dumps(row["timings"], sort_keys=True)
                 writer.writerow(row)
+
+    @staticmethod
+    def _timing_summary(results: Sequence[TaskResult]) -> dict[str, dict[str, float | int]]:
+        grouped: dict[str, list[float]] = {}
+        for result in results:
+            for name, value in result.timings.items():
+                grouped.setdefault(name, []).append(float(value))
+
+        def percentile(values: Sequence[float], quantile: float) -> float:
+            ordered = sorted(values)
+            return ordered[round((len(ordered) - 1) * quantile)]
+
+        return {
+            name: {
+                "count": len(values),
+                "total_seconds": sum(values),
+                "mean_seconds": sum(values) / len(values),
+                "p50_seconds": percentile(values, 0.50),
+                "p95_seconds": percentile(values, 0.95),
+                "p99_seconds": percentile(values, 0.99),
+                "max_seconds": max(values),
+            }
+            for name, values in sorted(grouped.items())
+            if values
+        }
 
     @staticmethod
     def _summary(
@@ -668,6 +1055,7 @@ class DownloadEngine:
         elapsed: float,
         monitor: EECUMonitor,
         stopped: bool,
+        catalog_metrics: Mapping[str, Any] | None = None,
     ) -> RunSummary:
         statuses: dict[str, set[str]] = {}
         for item in results:
@@ -691,6 +1079,7 @@ class DownloadEngine:
             completed_eecu_seconds=latest.completed_seconds if latest else None,
             in_progress_eecu_seconds=latest.in_progress_seconds if latest else None,
             stopped_by_eecu_budget=stopped,
+            catalog_metrics=dict(catalog_metrics or {}),
             results=tuple(results),
         )
 
@@ -700,6 +1089,7 @@ class DownloadEngine:
         total_samples: int,
         started: float,
         monitor: EECUMonitor,
+        resolver_stats: Any | None = None,
     ) -> None:
         elapsed = max(time.monotonic() - started, 1e-9)
         completed_ids = {item.sample_id for item in results}
@@ -708,10 +1098,17 @@ class DownloadEngine:
         completion_rate = len(completed_ids) / elapsed
         eta = (total_samples - len(completed_ids)) / completion_rate if completion_rate else None
         eecu = monitor.latest
+        catalog_suffix = ""
+        if resolver_stats is not None:
+            catalog_suffix = (
+                f" catalog_hit={resolver_stats.catalog_hit_rate:.1%}"
+                f" metadata_queries={resolver_stats.compute_features_calls}"
+                f" qa_rejections={resolver_stats.quality_rejections}"
+            )
         LOGGER.info(
             "progress=%d/%d success=%d elapsed=%.1fs eta=%s samples/s=%.3f "
             "bandwidth=%.3f MiB/s "
-            "reported_eecu_completed=%s reported_eecu_in_progress=%s",
+            "reported_eecu_completed=%s reported_eecu_in_progress=%s%s",
             len(completed_ids),
             total_samples,
             successful,
@@ -721,4 +1118,5 @@ class DownloadEngine:
             bytes_downloaded / (1024**2) / elapsed,
             f"{eecu.completed_seconds:.2f}" if eecu is not None else "unavailable",
             f"{eecu.in_progress_seconds:.2f}" if eecu is not None else "unavailable",
+            catalog_suffix,
         )

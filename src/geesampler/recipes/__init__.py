@@ -6,7 +6,13 @@ from .gedi import (
 )
 from .mining import mining_records
 from .mtbs import mtbs_source, negative_candidates, negative_pairs, positive_pairs
-from .sentinel2 import S2_BANDS, polygon_mask, sentinel2_collection, sentinel2_point_timeseries
+from .sentinel2 import (
+    S2_BANDS,
+    polygon_mask,
+    sentinel2_catalog_collection,
+    sentinel2_collection,
+    sentinel2_point_timeseries,
+)
 
 __all__ = [
     "S2_BANDS",
@@ -20,6 +26,7 @@ __all__ = [
     "polygon_mask",
     "positive_pairs",
     "quality_filtered_gedi",
+    "sentinel2_catalog_collection",
     "sentinel2_collection",
     "sentinel2_point_timeseries",
 ]

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "geesampler"
-version = "0.1.0"
+version = "0.2.0"
 description = "Concurrent, resumable point and image-patch sampling from Google Earth Engine"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "earthengine-api>=1.5",
+  "mgrs>=1.5",
   "pandas>=2.0",
   "pyproj>=3.5",
   "PyYAML>=6.0",

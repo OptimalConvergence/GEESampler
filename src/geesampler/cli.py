@@ -3,12 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .benchmark import refresh_benchmark_eecu
 from .cache import cache_mining_polygons
+from .catalog import S2SceneCatalog
 from .config import SamplerConfig, load_callable, patch_settings
+from .engine import make_workload_tag
+from .models import parse_datetime
+from .resolver import S2_COLLECTION
 from .sampler import Sampler
 from .sources import EESampleSource, FileSampleSource
 from .visualize import plot_benchmark, plot_sample_pair
@@ -47,11 +53,13 @@ def run_config(path: str | Path) -> dict[str, Any]:
     bands = download["bands"]
     kind = download.get("kind", "patch")
     if kind == "point":
+        _, selection = patch_settings(payload)
         summary = sampler.download_point_series(
             records,
             builder,
             bands=bands,
             scale=float(download.get("scale", 10)),
+            selection=selection,
             scenario=download.get("scenario", "points"),
             run_id=download.get("run_id"),
         )
@@ -93,6 +101,19 @@ def main(argv: list[str] | None = None) -> int:
     refresh.add_argument("config")
     cache = subparsers.add_parser("cache-mining", help="Cache and validate Mining Polygons v2")
     cache.add_argument("output")
+    catalog = subparsers.add_parser("catalog", help="Manage the local S2 metadata catalog")
+    catalog_commands = catalog.add_subparsers(dest="catalog_command", required=True)
+    catalog_sync = catalog_commands.add_parser("sync", help="Fill metadata for a run config")
+    catalog_sync.add_argument("config")
+    catalog_stats = catalog_commands.add_parser("stats", help="Show catalog coverage and size")
+    catalog_stats.add_argument("config")
+    catalog_import = catalog_commands.add_parser(
+        "import-geelinker", help="Import existing per-MGRS GEELinker JSON metadata"
+    )
+    catalog_import.add_argument("config")
+    catalog_import.add_argument("directory")
+    catalog_import.add_argument("--start", required=True)
+    catalog_import.add_argument("--end", required=True)
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
@@ -105,9 +126,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "plot-benchmark":
         print(plot_benchmark(args.csv, args.output))
     elif args.command == "refresh-benchmark-eecu":
-        sampler = Sampler.from_yaml(args.config)
-        print(refresh_benchmark_eecu(args.csv, sampler.config.auth.project))
-    else:
+        config = SamplerConfig.from_yaml(args.config)
+        print(refresh_benchmark_eecu(args.csv, config.auth.project))
+    elif args.command == "cache-mining":
         path, checksum = cache_mining_polygons(
             args.output,
             progress=lambda size: logging.getLogger(__name__).info(
@@ -115,6 +136,38 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         print(json.dumps({"path": str(path), "sha256": checksum}, indent=2))
+    elif args.catalog_command == "stats":
+        config = SamplerConfig.from_yaml(args.config)
+        if config.catalog is None:
+            raise ValueError("catalog.enabled must be true")
+        print(json.dumps(asdict(S2SceneCatalog(config.catalog.path).stats()), indent=2))
+    elif args.catalog_command == "import-geelinker":
+        config = SamplerConfig.from_yaml(args.config)
+        if config.catalog is None:
+            raise ValueError("catalog.enabled must be true")
+        start, end = parse_datetime(args.start), parse_datetime(args.end)
+        if start is None or end is None:
+            raise ValueError("catalog import dates cannot be empty")
+        files, scenes = S2SceneCatalog(config.catalog.path).import_geelinker(
+            args.directory, collection=S2_COLLECTION, start=start, end=end
+        )
+        print(json.dumps({"files": files, "scenes": scenes}, indent=2))
+    else:
+        config = SamplerConfig.from_yaml(args.config)
+        sampler = Sampler(config)
+        resolver = sampler.scene_resolver()
+        if resolver is None:
+            raise ValueError("catalog.enabled must be true")
+        payload = dict(config.raw)
+        records = list(_source(sampler, payload).records(payload.get("source", {}).get("limit")))
+        grid, selection = patch_settings(payload)
+        tag = make_workload_tag(
+            config.run.workload_prefix,
+            "catalog-sync",
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"),
+        )
+        resolver.prepare(records, grid=grid, selection=selection, workload_tag=tag)
+        print(json.dumps(asdict(resolver.stats()), indent=2))
     return 0
 
 

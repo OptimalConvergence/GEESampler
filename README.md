@@ -47,7 +47,7 @@ Mihomo service is available at `http://127.0.0.1:7890`.
 from functools import partial
 
 from geesampler import FileSampleSource, PatchGrid, Sampler, SceneSelection
-from geesampler.recipes.sentinel2 import S2_BANDS, sentinel2_collection
+from geesampler.recipes.sentinel2 import S2_BANDS, sentinel2_catalog_collection
 
 sampler = Sampler.from_yaml("examples/configs/prepared_points.yaml")
 samples = FileSampleSource("examples/data/points.csv").records()
@@ -55,7 +55,7 @@ grid = PatchGrid(size=336, scale=10)
 
 summary = sampler.download_patch_series(
     samples,
-    partial(sentinel2_collection, grid=grid),
+    partial(sentinel2_catalog_collection, grid=grid),
     bands=S2_BANDS,
     grid=grid,
     selection=SceneSelection("latest", 0, 90, max_scenes=2),
@@ -91,11 +91,57 @@ Each run directory contains:
 - `manifest.csv` with target/acquisition dates, geometry, labels, and provenance;
 - `ledger.sqlite` for safe resume;
 - `metrics.jsonl` with per-file latency and payload bytes;
+- `profile.json` with p50/p95/p99 time by discovery, pixel, QA, and write step;
 - `eecu.jsonl` with Cloud Monitoring snapshots when available;
 - `summary.json` with throughput and final status.
 
 Files are written to unique partial paths and atomically renamed. A repeated run
 with the same `run_id` skips outputs recorded as successful.
+
+## Incremental S2 metadata catalog
+
+Enable the embedded SQLite/RTree catalog to avoid discovering the same S2 scenes
+with `computeFeatures` for every sample:
+
+```yaml
+catalog:
+  enabled: true
+  path: ${GEESAMPLER_DATA_ROOT:-./geesampler-output}/catalog/sentinel2.sqlite
+  mode: read_through
+  metadata_workers: 2
+  query_window_days: 366
+  max_tiles_per_query: 8
+  metadata_cloud_max: 20
+  cloud:
+    mode: hybrid_inline
+    band: cs_cdf
+    threshold: 0.60
+    min_clear_fraction: 0.80
+```
+
+`read_through` groups missing metadata by MGRS tile and calendar-aligned time
+window, upserts it transactionally, and performs later date/geometry searches
+locally. Historical coverage remains cached; the most recent 30 days are checked
+again after 24 hours. Use `offline` to forbid catalog network fills or `refresh`
+for an explicit refresh.
+
+```bash
+geesampler catalog sync examples/configs/prepared_points.yaml
+geesampler catalog stats examples/configs/prepared_points.yaml
+geesampler catalog import-geelinker examples/configs/prepared_points.yaml \
+  /path/to/S2GridInfos --start 2017-01-01 --end 2025-01-01
+```
+
+Import dates are required because the legacy JSON files do not record which
+date interval was queried. The database stores only public scene metadata and
+patch-quality results—never credentials, authorization headers, or service-account
+contents.
+
+The default hybrid policy first applies the scene-wide metadata cloud ceiling,
+then downloads an internal uint8 Cloud Score+ clear band with the requested
+pixels. Clear fraction is evaluated locally, rejected temporary patches are
+discarded, and the next date-ranked scene is tried. Accepted output retains only
+the requested bands. Install the `geo` extra for this raster validation path.
 
 ## EECU progress and guards
 
@@ -161,8 +207,9 @@ geesampler cache-mining \
   "${GEESAMPLER_DATA_ROOT}/cache/global_mining_polygons_v2.parquet"
 ```
 
-S2 quality uses Cloud Score+ `cs_cdf >= 0.60` and requires at least 80% clear
-pixels over the requested patch. Default bands are B2, B3, B4, B8, B11, and B12.
+S2 quality uses a metadata cloud ceiling of 20%, then Cloud Score+
+`cs_cdf >= 0.60`, and requires at least 80% clear pixels over the requested
+patch. Default bands are B2, B3, B4, B8, B11, and B12.
 
 ## Validation and benchmarking
 
@@ -172,18 +219,28 @@ Create an RGB/mask figure:
 geesampler validate image.tif preview.png --mask mask.tif
 ```
 
-`geesampler.benchmark.benchmark_patch_downloads` runs the same samples across
-standard/high-volume endpoints, 128/256/336/512 patch sizes, and 4/8/16 workers.
-It writes raw and aggregated CSV files plus a static comparison of payload
-bandwidth and reported EECU/sample. Payload bandwidth is downloaded bytes divided
-by wall time; it is intentionally not whole-machine interface traffic.
+`geesampler.benchmark.staged_benchmark_patch_downloads` first screens the same
+samples across
+standard/high-volume endpoints, 128/256/336/512 patch sizes, 4/8/16/24/32
+download threads, metadata workers, cloud policies, and grouped/random scheduling.
+It retains four complementary configurations, then runs 128 samples with three
+repetitions per retained case. It writes raw and aggregated CSV files
+plus a static comparison of samples/s, payload MiB/s, reported EECU/sample, and
+pixel-request p95 latency. Cold catalog synchronization with 1/2/4 metadata
+workers is written separately to `catalog_worker_benchmark.csv`; every timed
+pixel case receives an identical warm metadata catalog and an empty patch-quality
+cache. Payload bandwidth is downloaded bytes divided by wall time; it is
+intentionally not whole-machine interface traffic.
 
-Run the included two-repetition trial and refresh delayed EECU values afterward:
+Run the included tuning trial and refresh delayed EECU values afterward:
 
 ```bash
 python examples/benchmark_s2.py
 geesampler refresh-benchmark-eecu \
-  "${GEESAMPLER_DATA_ROOT}/benchmarks/s2-small-final/benchmark_runs.csv" \
+  "${GEESAMPLER_DATA_ROOT}/benchmarks/s2-small-final/final/benchmark_runs.csv" \
+  examples/configs/mining.yaml
+geesampler refresh-benchmark-eecu \
+  "${GEESAMPLER_DATA_ROOT}/benchmarks/s2-small-final/catalog-workers/catalog_worker_benchmark.csv" \
   examples/configs/mining.yaml
 ```
 

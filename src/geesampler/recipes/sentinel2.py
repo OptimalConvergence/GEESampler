@@ -4,6 +4,7 @@ from typing import Any
 
 from ..grid import compute_grid
 from ..models import DEFAULT_PATCH_GRID, PatchGrid, SampleRecord
+from ..resolver import INLINE_CLEAR_BAND
 
 S2_BANDS = ("B2", "B3", "B4", "B8", "B11", "B12")
 S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
@@ -34,27 +35,46 @@ def sentinel2_collection(
     grid: PatchGrid = DEFAULT_PATCH_GRID,
     cloud_score_threshold: float = 0.60,
     min_clear_fraction: float = 0.80,
+    server_quality_filter: bool = True,
 ) -> Any:
-    """S2 SR linked with Cloud Score+, masked and patch-quality filtered."""
+    """S2 SR linked with Cloud Score+, with optional server-side patch filtering."""
     import ee
 
     geometry = ee.Geometry(sample.geometry)
     footprint = patch_geometry(sample, grid)
     source = ee.ImageCollection(S2_COLLECTION).filterBounds(geometry)
+    if not server_quality_filter:
+        return source
     cloud_score = ee.ImageCollection(CLOUD_SCORE_COLLECTION).filterBounds(geometry)
     linked = source.linkCollection(cloud_score, ["cs_cdf"])
 
     def score(image):
         clear = image.select("cs_cdf").gte(cloud_score_threshold)
+        result = image.updateMask(clear).addBands(clear.unmask(0).uint8().rename(INLINE_CLEAR_BAND))
         fraction = clear.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=footprint,
             scale=grid.scale,
             maxPixels=grid.size * grid.size * 2,
         ).get("cs_cdf")
-        return image.updateMask(clear).set("_geesampler_clear_fraction", fraction)
+        return result.set("_geesampler_clear_fraction", fraction)
 
     return linked.map(score).filter(ee.Filter.gte("_geesampler_clear_fraction", min_clear_fraction))
+
+
+def sentinel2_catalog_collection(
+    sample: SampleRecord,
+    *,
+    grid: PatchGrid = DEFAULT_PATCH_GRID,
+    cloud_score_threshold: float = 0.60,
+) -> Any:
+    """S2 preprocessing for catalog resolution and inline patch-quality validation."""
+    return sentinel2_collection(
+        sample,
+        grid=grid,
+        cloud_score_threshold=cloud_score_threshold,
+        server_quality_filter=False,
+    )
 
 
 def sentinel2_point_timeseries(

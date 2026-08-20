@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+from typing import Any
 
 from .auth import configure_proxy, initialize_earth_engine
+from .catalog import S2SceneCatalog
 from .config import SamplerConfig
 from .engine import DownloadEngine
 from .models import (
@@ -16,6 +18,7 @@ from .models import (
     SampleRecord,
     SceneSelection,
 )
+from .resolver import S2CatalogResolver
 
 
 class Sampler:
@@ -23,6 +26,7 @@ class Sampler:
         self.config = config
         configure_proxy(config.proxy_url)
         self.ee = initialize_earth_engine(config.auth) if initialize else None
+        self._catalog_resolver: S2CatalogResolver | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path, *, initialize: bool = True) -> Sampler:
@@ -35,6 +39,19 @@ class Sampler:
             ee_module=self.ee,
         )
 
+    def scene_resolver(self) -> S2CatalogResolver | None:
+        if self.config.catalog is None:
+            return None
+        if self.ee is None:
+            raise RuntimeError("Earth Engine must be initialized before creating a scene resolver")
+        if self._catalog_resolver is None:
+            self._catalog_resolver = S2CatalogResolver(
+                S2SceneCatalog(self.config.catalog.path),
+                ee_module=self.ee,
+                config=self.config.catalog.resolver,
+            )
+        return self._catalog_resolver
+
     def download_patch_series(
         self,
         records: Iterable[SampleRecord],
@@ -44,6 +61,7 @@ class Sampler:
         grid: PatchGrid = DEFAULT_PATCH_GRID,
         selection: SceneSelection = DEFAULT_SCENE_SELECTION,
         mask_builder: MaskBuilder | None = None,
+        scene_resolver: Any | None = None,
         scenario: str = "patches",
         run_id: str | None = None,
     ) -> RunSummary:
@@ -54,6 +72,7 @@ class Sampler:
             grid=grid,
             selection=selection,
             mask_builder=mask_builder,
+            scene_resolver=scene_resolver if scene_resolver is not None else self.scene_resolver(),
             scenario=scenario,
             run_id=run_id,
         )
@@ -65,6 +84,8 @@ class Sampler:
         *,
         bands: Sequence[str],
         scale: float = 10,
+        selection: SceneSelection = DEFAULT_SCENE_SELECTION,
+        scene_resolver: Any | None = None,
         scenario: str = "points",
         run_id: str | None = None,
     ) -> RunSummary:
@@ -73,6 +94,8 @@ class Sampler:
             collection_builder,
             bands=bands,
             scale=scale,
+            selection=selection,
+            scene_resolver=scene_resolver if scene_resolver is not None else self.scene_resolver(),
             scenario=scenario,
             run_id=run_id,
         )

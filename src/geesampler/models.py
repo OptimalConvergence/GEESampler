@@ -133,6 +133,8 @@ class TaskResult:
     target_date: str | None = None
     geometry: Geometry | None = None
     sample_properties: Mapping[str, Any] = field(default_factory=dict)
+    clear_fraction: float | None = None
+    timings: Mapping[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -153,6 +155,7 @@ class RunSummary:
     completed_eecu_seconds: float | None = None
     in_progress_eecu_seconds: float | None = None
     stopped_by_eecu_budget: bool = False
+    catalog_metrics: Mapping[str, Any] = field(default_factory=dict)
     results: Sequence[TaskResult] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:

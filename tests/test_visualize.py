@@ -27,7 +27,13 @@ def test_static_validation_and_benchmark_figures(tmp_path):
     with benchmark.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(
             stream,
-            fieldnames=["case", "bandwidth_mib_per_second", "eecu_per_success"],
+            fieldnames=[
+                "case",
+                "bandwidth_mib_per_second",
+                "samples_per_second",
+                "eecu_per_success",
+                "compute_pixels_p95_seconds",
+            ],
         )
         writer.writeheader()
         for index in range(8):
@@ -35,7 +41,9 @@ def test_static_validation_and_benchmark_figures(tmp_path):
                 {
                     "case": f"case-{index}",
                     "bandwidth_mib_per_second": index + 1,
+                    "samples_per_second": (index + 1) / 2,
                     "eecu_per_success": 10 - index,
+                    "compute_pixels_p95_seconds": 8 - index / 2,
                 }
             )
     output = plot_benchmark(benchmark, tmp_path / "benchmark.png")

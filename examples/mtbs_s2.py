@@ -9,7 +9,7 @@ from geesampler.recipes.mtbs import (
     negative_pairs,
     positive_pairs,
 )
-from geesampler.recipes.sentinel2 import S2_BANDS, polygon_mask, sentinel2_collection
+from geesampler.recipes.sentinel2 import S2_BANDS, polygon_mask, sentinel2_catalog_collection
 
 
 def zero_mask(_sample):
@@ -21,7 +21,7 @@ def zero_mask(_sample):
 def main(config_path: str = "examples/configs/mtbs.yaml") -> None:
     sampler = Sampler.from_yaml(config_path)
     grid = PatchGrid(336, 10)
-    builder = partial(sentinel2_collection, grid=grid)
+    builder = partial(sentinel2_catalog_collection, grid=grid)
     events = list(mtbs_source(limit=4).records())
     positives = list(positive_pairs(events))
     pre = [sample for sample in positives if sample.properties["Phase"] == "pre"]

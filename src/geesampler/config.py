@@ -11,6 +11,7 @@ from typing import Any
 import yaml
 
 from .models import AuthConfig, EECUMonitorConfig, PatchGrid, RunConfig, SceneSelection
+from .resolver import CatalogResolverConfig
 
 _ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
@@ -45,11 +46,18 @@ def load_callable(path: str) -> Callable[..., Any]:
 
 
 @dataclass(frozen=True)
+class CatalogSettings:
+    path: Path
+    resolver: CatalogResolverConfig
+
+
+@dataclass(frozen=True)
 class SamplerConfig:
     auth: AuthConfig
     run: RunConfig
     proxy_url: str | None
     raw: Mapping[str, Any]
+    catalog: CatalogSettings | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> SamplerConfig:
@@ -84,7 +92,32 @@ class SamplerConfig:
             workload_prefix=str(run_data.get("workload_prefix", "geesampler")),
             eecu=eecu,
         )
-        return cls(auth, run, payload.get("proxy_url"), payload)
+        catalog_data = payload.get("catalog", {})
+        catalog = None
+        if bool(catalog_data.get("enabled", False)):
+            cloud_data = catalog_data.get("cloud", {})
+            catalog = CatalogSettings(
+                path=Path(
+                    catalog_data.get("path", "./geesampler-output/catalog/sentinel2.sqlite")
+                ).expanduser(),
+                resolver=CatalogResolverConfig(
+                    mode=str(catalog_data.get("mode", "read_through")),
+                    metadata_workers=int(catalog_data.get("metadata_workers", 2)),
+                    metadata_retries=int(catalog_data.get("metadata_retries", 4)),
+                    retry_base_seconds=float(catalog_data.get("retry_base_seconds", 1)),
+                    query_window_days=int(catalog_data.get("query_window_days", 366)),
+                    max_tiles_per_query=int(catalog_data.get("max_tiles_per_query", 8)),
+                    recent_horizon_days=int(catalog_data.get("recent_horizon_days", 30)),
+                    recent_refresh_hours=int(catalog_data.get("recent_refresh_hours", 24)),
+                    metadata_cloud_max=float(catalog_data.get("metadata_cloud_max", 20)),
+                    cloud_mode=str(cloud_data.get("mode", "hybrid_inline")),
+                    qa_band=str(cloud_data.get("band", "cs_cdf")),
+                    qa_threshold=float(cloud_data.get("threshold", 0.60)),
+                    min_clear_fraction=float(cloud_data.get("min_clear_fraction", 0.80)),
+                    group_downloads=bool(catalog_data.get("group_downloads", True)),
+                ),
+            )
+        return cls(auth, run, payload.get("proxy_url"), payload, catalog)
 
 
 def patch_settings(payload: Mapping[str, Any]) -> tuple[PatchGrid, SceneSelection]:

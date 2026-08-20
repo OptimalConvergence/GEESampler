@@ -72,7 +72,7 @@ def plot_sample_pair(
 
 
 def plot_benchmark(csv_path: str | Path, output_path: str | Path) -> Path:
-    """Compare payload throughput and reported EECU/sample across benchmark cases."""
+    """Compare throughput, cost, and tail latency across benchmark cases."""
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -82,30 +82,54 @@ def plot_benchmark(csv_path: str | Path, output_path: str | Path) -> Path:
         raise ValueError("Benchmark CSV is empty")
     labels = [row["case"] for row in rows]
     bandwidth = [float(row["bandwidth_mib_per_second"]) for row in rows]
+    sample_rate = [float(row.get("samples_per_second") or "nan") for row in rows]
     eecu = [float(row["eecu_per_success"] or "nan") for row in rows]
-    order = np.argsort(bandwidth)
+    latency_key = (
+        "compute_pixels_p95_seconds"
+        if any(row.get("compute_pixels_p95_seconds") for row in rows)
+        else "planning_seconds"
+    )
+    latency = [float(row.get(latency_key) or "nan") for row in rows]
+    order = np.argsort(bandwidth if all(np.isnan(value) for value in sample_rate) else sample_rate)
     labels = [labels[index] for index in order]
     bandwidth = [bandwidth[index] for index in order]
+    sample_rate = [sample_rate[index] for index in order]
     eecu = [eecu[index] for index in order]
+    latency = [latency[index] for index in order]
     y = np.arange(len(labels))
 
-    figure, axes = plt.subplots(1, 2, figsize=(14, max(5, len(labels) * 0.42)), sharey=True)
-    axes[0].barh(y, bandwidth, color=BLUE, edgecolor="#1D4ED8")
-    axes[0].set_title("Payload bandwidth by configuration", color=INK)
-    axes[0].set_xlabel("MiB/s (downloaded payload / wall time)")
-    axes[0].set_yticks(y, labels)
-    axes[1].barh(y, eecu, color="#F7E7B2", edgecolor=GOLD)
-    axes[1].set_title("Reported EECU per successful sample", color=INK)
-    axes[1].set_xlabel("EECU-seconds/sample")
-    for axis in axes:
+    figure, axes_grid = plt.subplots(
+        2,
+        2,
+        figsize=(16, max(7, len(labels) * 0.65)),
+        sharey=True,
+    )
+    axes = axes_grid.ravel()
+    panels = (
+        (sample_rate, "Successful sample throughput", "samples/s", BLUE, "#1D4ED8"),
+        (bandwidth, "Downloaded payload throughput", "MiB/s", "#BED7F7", BLUE),
+        (eecu, "Reported compute per successful sample", "EECU-seconds/sample", "#F7E7B2", GOLD),
+        (
+            latency,
+            "Pixel-request tail latency" if latency_key.startswith("compute") else "Planning time",
+            "p95 seconds" if latency_key.startswith("compute") else "seconds/run",
+            "#F6C9A8",
+            "#C45A16",
+        ),
+    )
+    for axis, (values, title, xlabel, color, edge) in zip(axes, panels):
+        axis.barh(y, values, color=color, edgecolor=edge)
+        axis.set_title(title, color=INK)
+        axis.set_xlabel(xlabel)
+        axis.set_yticks(y, labels)
         axis.grid(axis="x", color=GRID, linewidth=0.8)
         axis.set_axisbelow(True)
         axis.spines[["top", "right"]].set_visible(False)
-    figure.suptitle("GEESampler benchmark comparison", color=INK, fontsize=15)
+    figure.suptitle("GEESampler sampling-efficiency benchmark", color=INK, fontsize=15)
     figure.text(
         0.5,
         0.01,
-        "EECU is workload-tagged Cloud Monitoring usage and may lag completed downloads.",
+        "Same sampled workload per case. EECU is workload-tagged Cloud Monitoring usage and may lag.",
         ha="center",
         color="#6B7280",
         fontsize=9,

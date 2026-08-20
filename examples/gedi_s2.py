@@ -6,7 +6,7 @@ import ee
 
 from geesampler import EESampleSource, PatchGrid, Sampler, SceneSelection
 from geesampler.recipes.gedi import find_gedi_granules, gedi_vector_sample_features
-from geesampler.recipes.sentinel2 import S2_BANDS, sentinel2_collection
+from geesampler.recipes.sentinel2 import S2_BANDS, sentinel2_catalog_collection
 
 
 def main(config_path: str = "examples/configs/gedi.yaml") -> None:
@@ -31,7 +31,7 @@ def main(config_path: str = "examples/configs/gedi.yaml") -> None:
     grid = PatchGrid(336, 10)
     sampler.download_patch_series(
         samples,
-        partial(sentinel2_collection, grid=grid),
+        partial(sentinel2_catalog_collection, grid=grid),
         bands=S2_BANDS,
         grid=grid,
         selection=SceneSelection("closest", -90, 90, 1),
