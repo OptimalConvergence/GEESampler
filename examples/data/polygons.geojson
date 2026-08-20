@@ -1,0 +1,13 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"SampleID": "demo-polygon", "Date": "2021-06-01"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[145.49, -37.51], [145.51, -37.51], [145.51, -37.49], [145.49, -37.49], [145.49, -37.51]]]
+      }
+    }
+  ]
+}

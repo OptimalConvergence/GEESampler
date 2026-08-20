@@ -1,0 +1,10 @@
+auth:
+  project: ${GEE_PROJECT}
+  service_account: ${GEE_SERVICE_ACCOUNT}
+  key_file: ${GEE_KEY_FILE}
+proxy_url: ${HTTPS_PROXY:-}
+run:
+  output_dir: ${GEESAMPLER_DATA_ROOT:-./geesampler-output}/runs/gedi
+  workers: 8
+  retries: 4
+  monitoring: {enabled: true, required: false, poll_seconds: 30}

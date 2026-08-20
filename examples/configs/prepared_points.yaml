@@ -1,0 +1,39 @@
+auth:
+  project: ${GEE_PROJECT}
+  service_account: ${GEE_SERVICE_ACCOUNT}
+  key_file: ${GEE_KEY_FILE}
+  high_volume: false
+
+proxy_url: ${HTTPS_PROXY:-}
+
+run:
+  output_dir: ${GEESAMPLER_DATA_ROOT:-./geesampler-output}/runs
+  workers: 8
+  retries: 4
+  workload_prefix: geesampler
+  monitoring:
+    enabled: true
+    required: false
+    poll_seconds: 30
+    warning_eecu_hours: null
+    hard_eecu_hours: null
+
+source:
+  type: file
+  path: examples/data/points.csv
+  id_column: SampleID
+  date_column: Date
+  limit: 8
+
+download:
+  kind: patch
+  scenario: prepared-s2
+  collection_builder: geesampler.recipes.sentinel2:sentinel2_collection
+  bands: [B2, B3, B4, B8, B11, B12]
+  patch_size: 336
+  scale: 10
+  selection:
+    mode: latest
+    start_offset_days: 0
+    end_offset_days: 90
+    max_scenes: 2

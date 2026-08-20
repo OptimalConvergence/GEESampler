@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.env
+.idea/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+geesampler-output/
+*.partial
+*.sqlite
+*.tif
+*.tiff
+*.png
+*.jsonl

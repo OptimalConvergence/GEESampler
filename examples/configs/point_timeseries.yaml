@@ -1,0 +1,22 @@
+auth:
+  project: ${GEE_PROJECT}
+  service_account: ${GEE_SERVICE_ACCOUNT}
+  key_file: ${GEE_KEY_FILE}
+proxy_url: ${HTTPS_PROXY:-}
+run:
+  output_dir: ${GEESAMPLER_DATA_ROOT:-./geesampler-output}/runs/point-timeseries
+  workers: 8
+  retries: 4
+  monitoring: {enabled: true, required: false, poll_seconds: 30}
+source:
+  type: file
+  path: examples/data/points.csv
+  id_column: SampleID
+  date_column: Date
+  limit: 2
+download:
+  kind: point
+  scenario: prepared-s2-timeseries
+  collection_builder: geesampler.recipes.sentinel2:sentinel2_point_timeseries
+  bands: [B2, B3, B4, B8, B11, B12]
+  scale: 10
