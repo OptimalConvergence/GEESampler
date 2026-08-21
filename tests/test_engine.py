@@ -402,7 +402,7 @@ def test_missing_preprocessed_candidate_falls_back_to_next_scene(tmp_path):
     resolver = MetadataResolver()
     engine = DownloadEngine(
         "project",
-        RunConfig(tmp_path, workers=1, retries=0, eecu=EECUMonitorConfig(enabled=False)),
+        RunConfig(tmp_path, workers=1, retries=4, eecu=EECUMonitorConfig(enabled=False)),
         ee_module=fake,
     )
     sample = SampleRecord(
@@ -421,4 +421,48 @@ def test_missing_preprocessed_candidate_falls_back_to_next_scene(tmp_path):
     assert summary.succeeded == 1
     assert len(fake.data.requests) == 2
     assert summary.results[0].scene_id == "scene-b"
+    assert summary.results[0].attempts == 2
+
+
+def test_transient_candidate_error_still_retries_same_scene(tmp_path):
+    fake = ResolvedEE()
+
+    class TransientData:
+        def __init__(self):
+            self.requests = []
+
+        def computePixels(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise ConnectionError("temporary transport failure")
+            return _single_band_tiff(True)
+
+    fake.data = TransientData()
+    engine = DownloadEngine(
+        "project",
+        RunConfig(
+            tmp_path,
+            workers=1,
+            retries=1,
+            retry_base_seconds=0,
+            eecu=EECUMonitorConfig(enabled=False),
+        ),
+        ee_module=fake,
+    )
+    sample = SampleRecord(
+        "sample-1",
+        {"type": "Point", "coordinates": [3, 45]},
+        datetime(2021, 7, 1, tzinfo=timezone.utc),
+    )
+    summary = engine.download_patch_series(
+        [sample],
+        lambda _sample: ResolvedCollection(),
+        bands=["B2"],
+        grid=PatchGrid(4, 10),
+        scene_resolver=MetadataResolver(),
+        run_id="transient-retry",
+    )
+    assert summary.succeeded == 1
+    assert len(fake.data.requests) == 2
+    assert summary.results[0].scene_id == "scene-a"
     assert summary.results[0].attempts == 2

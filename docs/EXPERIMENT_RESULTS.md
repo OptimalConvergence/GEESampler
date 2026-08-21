@@ -199,3 +199,42 @@ identity project-level Earth Engine Resource Viewer plus Service Usage Consumer
 before repeating the fair 1×8, 1×16, and 2×8 matrix. Total refreshed usage for
 the new pixel benchmarks was roughly 0.06 EECU-hours, far below the 100-hour
 ceiling.
+
+## v0.3 336-pixel metadata-only rerun
+
+The 336×336 metadata-only case was repeated on 2026-08-21 because its initial
+v0.3 throughput was inconsistent with the v0.2 result. The rerun used the first
+128 Mining Polygons v2 samples, six S2 bands, the high-volume endpoint, a warm
+catalog, spatial/temporal grouping, 16 workers, and three repetitions. Every
+timed run had a 100% catalog hit rate and made zero `computeFeatures` calls.
+
+The first rerun reproduced high steady-state throughput but exposed a
+deterministic tail. Six samples encountered catalog candidates absent from the
+preprocessed collection. Each missing candidate was incorrectly retried five
+times with exponential backoff before the engine advanced to the next ranked
+candidate. The worst sample accumulated 16 attempts and about 69 seconds even
+though its final valid download needed only 2–3 seconds. This reduced the
+three-run end-to-end mean to 1.229 samples/s.
+
+The engine now treats that specific missing-image response as non-transient and
+advances immediately, while retaining retries for transient network and server
+errors. A focused three-repetition validation of all six stragglers completed
+18/18 downloads. The former worst case required four candidate attempts and
+4.8–7.7 seconds instead of 16 attempts and about 69 seconds.
+
+The corrected full benchmark produced:
+
+| Repetition | Accepted | Elapsed (s) | Samples/s | Useful MiB/s | p95 pixel time (s) | EECU-s/success |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 115/128 | 24.33 | 4.726 | 4.113 | 3.124 | 0.478 |
+| 2 | 115/128 | 33.32 | 3.451 | 3.003 | 3.035 | 0.461 |
+| 3 | 115/128 | 39.32 | 2.925 | 2.545 | 3.014 | 0.491 |
+| **Mean** | **345/384** | — | **3.701** | **3.221** | **3.058** | **0.477** |
+
+The 13 failures per repetition were immediate, valid outcomes with no
+metadata-qualified scene. Compared with the v0.2 result of 3.040 samples/s,
+the corrected v0.3 mean is 21.7% higher. The earlier v0.3 worker and patch rows
+remain useful as records of that live run, but they no longer represent current
+336-pixel metadata-only performance. Metadata-only still provides no Cloud
+Score validation and remains a speed baseline rather than a production-quality
+equivalent to `hybrid_probe`.
