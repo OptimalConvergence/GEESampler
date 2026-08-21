@@ -1002,11 +1002,13 @@ class DownloadEngine:
                     retained_bytes=output.stat().st_size
                     + (mask_output.stat().st_size if mask_output else 0),
                 )
-            except Exception as exc:  # noqa: BLE001 - remote errors are retried uniformly
+            except Exception as exc:  # noqa: BLE001 - transient remote errors are retried
                 error = exc
                 temp.unlink(missing_ok=True)
                 if mask_temp:
                     mask_temp.unlink(missing_ok=True)
+                if _MISSING_IMAGE_ERROR in str(exc):
+                    break
                 if attempts <= self.config.retries:
                     delay = self.config.retry_base_seconds * (2 ** (attempts - 1))
                     time.sleep(delay + random.random() * min(1.0, delay / 4.0))

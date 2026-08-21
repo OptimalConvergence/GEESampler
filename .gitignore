@@ -10,6 +10,7 @@ build/
 dist/
 geesampler-output/
 artifacts/v0_3_live/
+artifacts/v0_3_rerun*/
 *.partial
 *.sqlite
 *.tif
